@@ -274,6 +274,51 @@ holds (the runner-up's probability and the entropy added nothing), and without t
 on two prompt sets. With `--lookup-chain 3` and suffix drafts, which already use the lookup, the official benchmark
 was a wash (short chat -2.5%, agent sessions +0.8%, 3 rounds), so it is not in the settings above.
 
+### 7. Faster prompt experts and adaptive swaps from the PCIe fetches
+
+Three changes with the same output (engine `89ef4423`), found by a read-only review of where the time goes and then
+measured:
+
+- **`STRATA_PF_DOWN_STREAMS=4`**: the prompt's expert down products (and their SwiGLU) of a 16-expert group run on 4
+  streams forked from the compute stream and joined back before the group's buffers are reused, as part 2's gate/up
+  products already do. A down product of ~100 tokens fills only ~27 of the card's workgroup slots. The calls are the
+  same hipBLASLt solution with the same arguments, only those that need no workspace, each writing its own rows.
+  Fresh prompts: 2K -3..-4%, 4K -2..-3%, 16K and 32K -2% read time (every round faster). 8 streams measured the same
+  as 4. Do not raise `GPU_MAX_HW_QUEUES` to 8 on this card: every prompt got 10-20% slower.
+- **`STRATA_PCIE_USAGE=1` + `STRATA_PCIE_KEEP=96`**: each layer sends about a third of its missed experts over PCIe
+  (`--pcie-frac 0.35`) and drops the bytes after use, and between windows the adaptive tier copies ~35-50 experts from
+  RAM into VRAM, which the next window waits for. Almost every one of those swaps missed one window earlier. Today's
+  pick sends the last misses in routing order over PCIe, which covered 16% of the next round's swaps (replay of a
+  served-settings routing dump); picking them by the tier's own usage count covers 63%. `STRATA_PCIE_KEEP=96` lands the
+  fetched blobs in a 96-slot ring that keeps them for the window, and the tier copies such a swap inside VRAM. About 31
+  of ~50 swaps per window now come from the ring, and the wait for the copies fell from 1.2-1.7 ms to 0.2-0.5 ms a
+  window. Six 600-token prompts x 256 tokens, no lookup chain, the same tokens in every run, 5 alternating rounds
+  (medians): 106.15 -> 110.48 tokens/s (**+4.1%**, every round faster). With part 4 the output does not depend on
+  which experts the GPU or the CPU computes, so this changes only the speed.
+- **IQ3_XXS rows on the CPU** (on by default, `STRATA_REPLICA_XXS=0` = before): part 4's CPU replica decodes IQ3_XXS
+  (the gate/up type of 17 of the 48 layers in the IQ3_S pack) with one gather and a popcount sign mask instead of 16
+  table loads and 8 sign lookups: the same table words, bit-identical to the GPU in `expert_replica` on all 17 layers;
+  decode +0.7%.
+
+Checked: teacher-forced KL against the previous engine 0.0000 (100% the same top token, perplexity 4.447 = 4.447),
+the same generated tokens. `tools/strata_bench.py --long`, against engine `8928808b`, 3 alternating rounds (medians):
+
+| Test | `8928808b` | `89ef4423` + the switches | Change |
+| --- | ---: | ---: | ---: |
+| Short chat, writes answers | 100.1 tokens/s | 102.4 tokens/s | +2.3% |
+| Short chat, first token | 0.84 s | 0.83 s | -1% |
+| 4K prompt, reads | 1,419 tokens/s | 1,464 tokens/s | **+3.2%** |
+| 16K prompt, reads | 1,920 tokens/s | 1,955 tokens/s | +1.8% |
+| 32K prompt, reads | 1,993 tokens/s | 2,027 tokens/s | +1.7% |
+| Agent session, first token per turn | 2.87 s | 2.78 s | **-3.1%** |
+| Agent session, writes answers | 107.2 tokens/s | 109.1 tokens/s | +1.8% |
+
+The prompt rows: every round faster but one 16K round (equal). The writing rows overlap (the lookup chain's drafts
+follow timing, ~1-2% noise), so the fixed-draft measurement above is the better number for decode.
+
+Also tried: upstream's `STRATA_DEQUANT_WIDE=1` (8 values a thread for the dense Q4_K/Q5_K weights) is bit-exact here
+but 8-14% slower than the kernel it replaces, which already writes ~1.6 TB/s.
+
 ### Tried on this card and not kept
 
 - **Prefetching the next layer's experts.** Upstream's look-ahead (`RouterLookahead`: the next layer's router applied

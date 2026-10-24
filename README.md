@@ -31,6 +31,12 @@ Report: [bench/results/2026-10-24-...-0.2.4](bench/results/2026-10-24-community-
 (the earlier comparison against 0.1.44.1:
 [2026-10-14-...-0.1.44-cum](bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44-cum/)).
 
+Newer, with the same output: three more bit-exact switches (engine `89ef4423`, [Settings](#settings)) against the
+engine above, same day, 3 alternating rounds, medians: reads 4K prompts **+3.2%** (1,419 -> 1,464 tokens/s), 16K +1.8%,
+32K +1.7%, agent turn first token **-3.1%** (2.87 -> 2.78 s), writes answers +2.3% short chat / +1.8% agent sessions
+(those rounds overlap; with the drafts held fixed, decode is **+4.8%**). Report:
+[bench/results/2026-10-24-...-speed](bench/results/2026-10-24-community-rx-7900-xtx-gfx1100-speed/).
+
 Decode is also deterministic: the same question gives the same answer whatever the drafter does (and, with an opt-in
 build, whatever the expert placement).
 
@@ -120,6 +126,13 @@ hangs the engine.
 Faster long prompts with the same output: add `"STRATA_PF_PIECE": "8192"` to `env` and change `"--prefill", "auto"` to
 `"--prefill", "auto:32768"` in `args`. Prompts are read in 32K chunks but computed exactly as 8K chunks, so the output
 and the conversation checkpoints are bit-identical: a fresh 32K prompt +13-16%, long documents +10-12%.
+
+Newest, same output (engine `89ef4423`; KL 0.0000 and the same tokens): add
+`"STRATA_PF_DOWN_STREAMS": "4", "STRATA_PCIE_USAGE": "1", "STRATA_PCIE_KEEP": "96"` to `env`. The first spreads the
+prompt's expert down products over 4 GPU streams (prompts +2-3%). The other two send the experts the adaptive VRAM tier
+is about to swap in over PCIe in the window before and keep them in a 96-blob ring (about 130 MB of VRAM), so most
+swaps become a copy inside VRAM (decode +4.1% with the drafts held fixed). The CPU's IQ3_XXS expert rows are also
+faster (+0.7%, on by default). Details: [docs/RX7900XTX.md, part 7](docs/RX7900XTX.md#7-faster-prompt-experts-and-adaptive-swaps-from-the-pcie-fetches).
 
 The engine's log (`strata-<model>.log`) shows that they are on:
 
