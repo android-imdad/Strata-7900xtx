@@ -11,9 +11,32 @@ Measured on: RX 7900 XTX 24 GB (gfx1100), Ryzen 7 9800X3D, 62 GiB RAM, Linux 7.2
 
 ## Results
 
-`tools/strata_bench.py --long`, same day, 3 alternating rounds, medians (each round itself the median of 3 runs per
-test). Upstream 0.1.44.1 (its defaults, every output-changing switch off) against this fork merged with 0.1.44.1
-(parts 1-6 with the parity build, `STRATA_MTP_HIP_PRIO=1`, engine `d4b184ee`):
+`tools/strata_bench.py --long`, same day (24 October), 3 alternating rounds, medians (each round itself the median of
+3 runs per test). Upstream v0.2.4.1 (`8183c6b6`, engine 0.1.49.1; its defaults, every output-changing switch off)
+against this fork merged with v0.2.4.1 (parts 1-6 with the parity build, `STRATA_MTP_HIP_PRIO=1`, engine `8928808b`):
+
+| Test | Upstream v0.2.4.1 `8183c6b6` | This fork | Change |
+| --- | ---: | ---: | ---: |
+| Short chat, writes answers | 82.6 tokens/s | 97.5 tokens/s | **+18%** |
+| Short chat, first token | 1.20 s | 0.84 s | **-30%** |
+| 4K prompt, reads | 1,021 tokens/s | 1,365 tokens/s | **+34%** |
+| 16K prompt, reads | 1,341 tokens/s | 1,868 tokens/s | **+39%** |
+| 32K prompt, reads | 1,359 tokens/s | 1,928 tokens/s | **+42%** |
+| Agent session, first token per turn | 3.98 s | 2.99 s | **-25%** |
+| Agent session, writes answers | 90.3 tokens/s | 95.3 tokens/s | +5.5% |
+
+Every round of the fork beat every round of upstream in every row but the last, where the rounds overlap (fork
+91.5-102.9, upstream 89.4-93.3 tokens/s). Both engines measured 5-7% below the 14 October runs on this PC (the machine,
+not the code: upstream lost the same share), so across dates compare the percentages. Report:
+[bench/results/2026-10-24-...-0.2.4](../bench/results/2026-10-24-community-rx-7900-xtx-gfx1100-0.2.4/).
+Merging v0.2.4.1 (1,836 upstream commits) changed none of this fork's output: kl.py over 2,557 positions after 16K,
+16K and 64K prompts gives the same top token everywhere, mean KL 0.0000, perplexity 4.447 = 4.447 against the
+0.1.44.1-based engine `d4b184ee`. A fresh 32K prompt with exact 32K chunks gives the 8K-chunk run's residual stream
+bit for bit at every half layer (`STRATA_PF_LAYER_DUMP`); that check found and fixed one merge bug (`8928808b`:
+upstream's new chunk-size variable shadowed a row width in `STRATA_PF_PIECE`'s checkpoint split, and 32K prompts with a
+checkpoint inside went non-finite).
+
+The previous comparison, against upstream 0.1.44.1 (14 October, engine `d4b184ee`):
 
 | Test | Upstream 0.1.44.1 `296b59d2` | This fork | Change |
 | --- | ---: | ---: | ---: |
@@ -25,7 +48,7 @@ test). Upstream 0.1.44.1 (its defaults, every output-changing switch off) agains
 | Agent session, first token per turn | 3.88 s | 2.93 s | **-24%** |
 | Agent session, writes answers | 96.4 tokens/s | 102.5 tokens/s | **+6%** |
 
-Every round of the fork beat every round of upstream in every row. Reports:
+Reports:
 [bench/results/2026-10-14-...-0.1.44-cum](../bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44-cum/); the
 same comparison before part 6 (short chat +10%, agent sessions +2%):
 [2026-10-14-...-0.1.44](../bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44/).

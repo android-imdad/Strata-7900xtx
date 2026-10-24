@@ -9,31 +9,30 @@ a 125-billion-parameter model, on one gaming PC. This fork tunes it for the RX 7
 **bit-identical** to upstream (the same log-probabilities and the same token at every position, so the same perplexity): faster, with nothing traded
 for quality. The one exception is an opt-in build, described under [Install](#install).
 
-Upstream Strata 0.1.44.1 against this fork (merged with 0.1.44.1), same PC, same day, alternating rounds, medians of 3
+Upstream Strata v0.2.4.1 against this fork (merged with v0.2.4.1), same PC, same day, alternating rounds, medians of 3
 (RX 7900 XTX 24 GB, Ryzen 7 9800X3D, 62 GiB RAM, Linux, ROCm 10.2, IQ3_S):
 
-| | Upstream 0.1.44.1 | RX 7900 XTX edition | |
+| | Upstream v0.2.4.1 | RX 7900 XTX edition | |
 | --- | ---: | ---: | ---: |
-| Writes answers (short chat) | 88.8 tokens/s | 105.0 tokens/s | **+18%** |
-| First token (short chat) | 1.12 s | 0.82 s | **-27%** |
-| Reads a 4K prompt | 1,081 tokens/s | 1,443 tokens/s | **+33%** |
-| Reads a 16K prompt | 1,397 tokens/s | 1,921 tokens/s | **+37%** |
-| Reads a 32K prompt | 1,406 tokens/s | 1,990 tokens/s | **+42%** |
-| Agent turn, first token | 3.88 s | 2.93 s | **-24%** |
-| Agent session, writes answers | 96.4 tokens/s | 102.5 tokens/s | **+6%** |
+| Writes answers (short chat) | 82.6 tokens/s | 97.5 tokens/s | **+18%** |
+| First token (short chat) | 1.20 s | 0.84 s | **-30%** |
+| Reads a 4K prompt | 1,021 tokens/s | 1,365 tokens/s | **+34%** |
+| Reads a 16K prompt | 1,341 tokens/s | 1,868 tokens/s | **+39%** |
+| Reads a 32K prompt | 1,359 tokens/s | 1,928 tokens/s | **+42%** |
+| Agent turn, first token | 3.98 s | 2.99 s | **-25%** |
+| Agent session, writes answers | 90.3 tokens/s | 95.3 tokens/s | +5.5% |
 
 The fork runs the settings below, including the opt-in parity build, exact 32K prompt chunks and the draft rule
-`STRATA_SPEC_CUM=0.5` (engine `d4b184ee`). Upstream runs its defaults with every output-changing switch off. Every
-round of the fork beat every round of upstream in every row; writing speed still moves a few percent between runs.
-Reports: [bench/results/2026-10-14-...-0.1.44-cum](bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44-cum/)
-(the earlier comparison, before `STRATA_SPEC_CUM`:
-[2026-10-14-...-0.1.44](bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44/)).
+`STRATA_SPEC_CUM=0.5` (engine `8928808b`). Upstream runs its defaults with every output-changing switch off. Every
+round of the fork beat every round of upstream in every row except agent-session writing speed, where the rounds
+overlap (fork 91.5-102.9, upstream 89.4-93.3 tokens/s); writing speed moves a few percent between runs. Both engines
+measured 5-7% below the 14 October runs on this PC, so compare the percentages, not the absolute numbers, across dates.
+Report: [bench/results/2026-10-24-...-0.2.4](bench/results/2026-10-24-community-rx-7900-xtx-gfx1100-0.2.4/)
+(the earlier comparison against 0.1.44.1:
+[2026-10-14-...-0.1.44-cum](bench/results/2026-10-14-community-rx-7900-xtx-gfx1100-0.1.44-cum/)).
 
 Decode is also deterministic: the same question gives the same answer whatever the drafter does (and, with an opt-in
 build, whatever the expert placement).
-
-<p align="center"><a href="https://ko-fi.com/imdadismail"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support this fork on Ko-fi" width="446"></a><br>
-<sub>This fork is free. If it runs well on your RX 7900 XTX, a coffee keeps the benchmarking going.</sub></p>
 
 <details>
 <summary><b>Read more:</b> how it works</summary>
