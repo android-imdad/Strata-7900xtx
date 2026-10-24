@@ -393,6 +393,16 @@ int hipblaslt_solution_for(void* opaque_state, strata::prefill::hipblaslt::Input
     return hipblaslt_ext::getIndexFromAlgo(algo);
 }
 
+// STRATA_PF_DOWN_STREAMS: hipBLASLt takes this call with a solution that needs no workspace (so calls on other streams
+// cannot race on the shared one)
+bool hipblaslt_no_workspace(void* opaque_state, strata::prefill::hipblaslt::InputType type, int64_t t, int64_t n,
+                            int64_t k, int64_t ldy, float beta) {
+    auto* state = static_cast<HipLtState*>(opaque_state);
+    if (!state || t <= 0 || n <= 0 || k <= 0 || t > INT_MAX || n > INT_MAX || k > INT_MAX || ldy > INT_MAX || ldy < n) return false;
+    const auto resolved = resolve_hipblaslt_algo(*state, type, (int) t, (int) n, (int) k, (int) ldy, beta);
+    return resolved.supported && resolved.workspace_bytes == 0;
+}
+
 bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType type, const uint16_t* x,
                    const uint16_t* w, float* y, int64_t t, int64_t n, int64_t k, int64_t ldy, float beta,
                    void* stream, int64_t ldx = 0) {
@@ -1129,6 +1139,33 @@ bool Gemm::f16_on_rocblas(int64_t T, int64_t N, int64_t K) const {
     return true;
 #else
     (void) T; (void) N; (void) K;
+    return false;
+#endif
+}
+
+bool Gemm::f16_lt_ok(int64_t T, int64_t N, int64_t K) const {
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    if (T <= 0 || N <= 0 || f16_io_ || !hipblaslt_state_) return false;
+    // the switches f16() reads before hipBLASLt (STRATA_PF_GEMM, STRATA_WMMA_GEMM): either one may take the call
+    static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
+    static const bool pf_on = [] { const char* v = std::getenv("STRATA_PF_GEMM"); return v && v[0] == '1'; }();
+    if (wmma_on || pf_on) return false;
+    return hipblaslt_no_workspace(hipblaslt_state_, strata::prefill::hipblaslt::InputType::f16, T, N, K, N, 0.0f);
+#else
+    (void) T; (void) N; (void) K;
+    return false;
+#endif
+}
+
+bool Gemm::f16_on(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, void* stream) {
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    if (!f16_lt_ok(T, N, K)) return false;
+    if (!try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::f16, X, W, Y, T, N, K, N, 0.0f, stream))
+        return false;
+    STRATA_ABSORB_HIPBLAS_STICKY("hipBLASLt f16");
+    return true;
+#else
+    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) stream;
     return false;
 #endif
 }

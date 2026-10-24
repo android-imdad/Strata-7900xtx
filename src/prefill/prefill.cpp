@@ -910,6 +910,13 @@ struct Prefill::Impl {
     cudaStream_t cs = nullptr, copy = nullptr;
     cudaStream_t copy2 = nullptr;            // STRATA_PF_COPY2: the small chunks' second copy stream (two DMA engines)
     cudaEvent_t copy2_mark = nullptr;        // ... and in the lean streamed walk, the other stream's progress at a batch end
+    // STRATA_PF_DOWN_STREAMS=n (2..8): a GU_EXACT group's SwiGLU + down products spread over n streams forked from cs
+    // and joined back to it before the group's buffers are reused (one down product of ~100 tokens fills ~27 of the
+    // card's workgroup slots)
+    static constexpr int kDownStreamsMax = 8;
+    int down_ns = 0;
+    cudaStream_t down_st[kDownStreamsMax] = {};
+    cudaEvent_t down_fork = nullptr, down_join[kDownStreamsMax] = {};
     Gemm gemm;
     std::vector<void*> owned;
     // chunk buffers
@@ -1132,6 +1139,11 @@ void Prefill::release() {
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
     if (impl_->copy2) cudaStreamDestroy(impl_->copy2);
     if (impl_->copy2_mark) cudaEventDestroy(impl_->copy2_mark);
+    for (int i = 0; i < Impl::kDownStreamsMax; ++i) {   // idle: every group joins them to cs, synchronized above
+        if (impl_->down_st[i]) cudaStreamDestroy(impl_->down_st[i]);
+        if (impl_->down_join[i]) cudaEventDestroy(impl_->down_join[i]);
+    }
+    if (impl_->down_fork) cudaEventDestroy(impl_->down_fork);
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->kv_released) cudaEventDestroy(impl_->kv_released);
     if (impl_->kv_ready) cudaEventDestroy(impl_->kv_ready);
@@ -1565,6 +1577,15 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         cudaGetLastError();
         if (m.copy2) cudaStreamDestroy(m.copy2);
         m.copy2 = nullptr;
+    }
+    if (const char* v = std::getenv("STRATA_PF_DOWN_STREAMS"); v != nullptr && m.down_ns == 0 && m.down_fork == nullptr) {
+        const int n = std::min(std::atoi(v), (int) Impl::kDownStreamsMax);
+        bool dok = n >= 2 && cudaEventCreateWithFlags(&m.down_fork, cudaEventDisableTiming) == cudaSuccess;
+        for (int i = 0; dok && i < n; ++i)
+            dok = cudaStreamCreateWithFlags(&m.down_st[i], cudaStreamNonBlocking) == cudaSuccess &&
+                  cudaEventCreateWithFlags(&m.down_join[i], cudaEventDisableTiming) == cudaSuccess;
+        if (dok) m.down_ns = n;
+        else cudaGetLastError();   // off (the streams made so far are destroyed with the rest)
     }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
@@ -4858,6 +4879,36 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // cover several pieces, the down product's order follows its token count)
                         std::vector<int64_t> dn_o0, dn_n;
                         std::vector<int> dn_q;
+                        // STRATA_PF_DOWN_STREAMS: entry i's SwiGLU and down product on stream i % ns.  Each reads only
+                        // its own GU rows and dequantized down weight (ready on cs at the fork) and writes only its own
+                        // Hh and Dm rows (SwiGLU is elementwise, so its rows in other calls are the same bits); cs waits
+                        // for all of them before the next dequant reuses the group's buffers.  Only when hipBLASLt takes
+                        // every product with no workspace: the same solution and arguments as on cs, so the same bits.
+                        auto down_spread = [&](int n, const int64_t* o0, const int64_t* cnt, const int* q) -> bool {
+                            if (m.down_ns < 2 || n < 2) return false;
+                            for (int i = 0; i < n; ++i)
+                                if (!m.gemm.f16_lt_ok(cnt[i], N, 640)) return false;
+                            const int ns = std::min(n, m.down_ns);
+                            pt.mark(kPfGemmD, cs);
+                            cudaEventRecord(m.down_fork, m.cs);
+                            for (int s = 0; s < ns; ++s) cudaStreamWaitEvent(m.down_st[s], m.down_fork, 0);
+                            int failed[kGuExactMax];
+                            int nf = 0;
+                            for (int i = 0; i < n; ++i) {
+                                const cudaStream_t st = m.down_st[i % ns];
+                                swiglu_interleaved(m.GU + o0[i] * 1280, m.Hh + o0[i] * 640, cnt[i], st);
+                                if (!m.gemm.f16_on(m.Hh + o0[i] * 640, m.dq_d[q[i]], m.Dm + o0[i] * N, cnt[i], N, 640, st))
+                                    failed[nf++] = i;
+                            }
+                            for (int s = 0; s < ns; ++s) {
+                                cudaEventRecord(m.down_join[s], m.down_st[s]);
+                                cudaStreamWaitEvent(m.cs, m.down_join[s], 0);
+                            }
+                            for (int f = 0; f < nf; ++f)   // a failed launch (nothing ran): the call on cs, after its SwiGLU
+                                m.gemm.f16(m.Hh + o0[failed[f]] * 640, m.dq_d[q[failed[f]]], m.Dm + o0[failed[f]] * N,
+                                           cnt[failed[f]], N, 640);
+                            return true;
+                        };
                         auto gx_flush = [&]() {
                             gx_nbuf = 0;
                             if (gx.n == 0) return;
@@ -4865,12 +4916,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (!gu_exact_run(gx, m.gu_exact_ws, m.cs))   // (a failed launch: the same products, one call each)
                                 for (int i = 0; i < gx.n; ++i) m.gemm.f16(gx.x[i], gx.w[i], gx.y[i], gx.t[i], 1280, N);
                             if (!dn_n.empty()) {
-                                for (int i = 0; i < gx.n; ++i)
-                                    swiglu_interleaved(m.GU + gx_o0[i] * 1280, m.Hh + gx_o0[i] * 640, gx.t[i], m.cs);
-                                pt.mark(kPfGemmD, cs);
-                                for (size_t i = 0; i < dn_n.size(); ++i)
-                                    m.gemm.f16(m.Hh + dn_o0[i] * 640, m.dq_d[dn_q[i]], m.Dm + dn_o0[i] * N, dn_n[i], N, 640);
+                                if (dn_n.size() > (size_t) kGuExactMax ||
+                                    !down_spread((int) dn_n.size(), dn_o0.data(), dn_n.data(), dn_q.data())) {
+                                    for (int i = 0; i < gx.n; ++i)
+                                        swiglu_interleaved(m.GU + gx_o0[i] * 1280, m.Hh + gx_o0[i] * 640, gx.t[i], m.cs);
+                                    pt.mark(kPfGemmD, cs);
+                                    for (size_t i = 0; i < dn_n.size(); ++i)
+                                        m.gemm.f16(m.Hh + dn_o0[i] * 640, m.dq_d[dn_q[i]], m.Dm + dn_o0[i] * N, dn_n[i], N, 640);
+                                }
                                 dn_o0.clear(); dn_n.clear(); dn_q.clear();
+                                gx.n = 0;
+                                return;
+                            }
+                            int64_t gx_t[kGuExactMax];
+                            for (int i = 0; i < gx.n; ++i) gx_t[i] = gx.t[i];
+                            if (down_spread(gx.n, gx_o0, gx_t, gx_q)) {
                                 gx.n = 0;
                                 return;
                             }
