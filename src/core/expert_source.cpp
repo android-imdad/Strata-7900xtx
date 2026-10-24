@@ -4922,6 +4922,28 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // pinned (the fetch below checks), else it stays a CPU miss exactly as before.  Read once.
         static const bool pcie_min1 = [] { const char* v = std::getenv("STRATA_PCIE_MIN1"); return v && std::atoi(v) != 0; }();
         if (pcie_min1 && pcie_ok && m < 1 && nmiss >= 2) m = 1;
+        // STRATA_PCIE_USAGE=1: the m misses with the largest decayed usage (the adaptive tier's count) instead of the
+        // last m in routing order - the ones its next round swaps in, so with STRATA_PCIE_KEEP their fetched blobs
+        // become those swaps.  Which experts the GPU computes changes, not how many; read once.
+        static const bool pick_usage = [] { const char* v = std::getenv("STRATA_PCIE_USAGE"); return v && std::atoi(v) != 0; }();
+        bool chosen[kMaxWindowEntries];
+        const bool by_usage = pick_usage && m > 0 && m < nmiss && !d.usage.empty() && d.fs == nullptr && !fs_first;
+        if (by_usage) {
+            std::pair<float, int> mu[kMaxWindowEntries];
+            int nm = 0;
+            const float* u = d.usage.data() + (size_t) d.layers * (size_t) d.n_expert;
+            for (int q = 0; q < nd; ++q) {
+                chosen[q] = false;
+                const int32_t e = ids[distinct[q]];
+                if (skip_d[q] || e < 0 || e >= d.n_expert || d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0 ||
+                    (d.peer != nullptr && d.peer->has(d.layers, e)) || helper_holds(e))
+                    continue;
+                mu[nm++] = {u[e], q};
+            }
+            // the largest usage first; ties to the later in routing order (today's pick)
+            std::sort(mu, mu + nm, [](const auto& a, const auto& b) { return a.first != b.first ? a.first > b.first : a.second > b.second; });
+            for (int i = 0; i < m && i < nm; ++i) chosen[mu[i].second] = true;
+        }
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];
@@ -4953,7 +4975,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
                     if (d.fs != nullptr) d.fs->note_miss(d.src, d.layers, e);
-                    if (miss_rank >= nmiss - m && fetches < P.staging_cap && fetches < 64) {
+                    if ((by_usage ? chosen[q] : miss_rank >= nmiss - m) && fetches < P.staging_cap && fetches < 64) {
                         const uint8_t* src = d.src->pinned(d.layers, e) ? d.src->blob(d.layers, e) : nullptr;
                         if (src != nullptr) {
                             kd = 1;
@@ -4980,10 +5002,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }
         P.start[groups] = entries;
         const uint64_t bb = lay.blob_bytes(d.layers);
+        // STRATA_PCIE_KEEP: this layer's fetches take the ring's next run of slots (from slot 0 again when it would
+        // pass the end); fetch_dma copies to `staging` at the ring's stride
+        unsigned long long stride = bb;
+        if (P.pcie_mode == 0 && P.ring_cap > 0 && fetches > 0) {
+            int32_t base = P.ring_cur;
+            if (base + fetches > P.ring_cap) base = 0;
+            P.ring_cur = base + fetches;
+            P.staging = P.ring + (unsigned long long) base * (unsigned long long) P.ring_stride;
+            stride = (unsigned long long) P.ring_stride;
+            for (int q = 0; q < fetches; ++q)
+                P.ring_owner[base + q] = (int32_t) (d.layers * d.n_expert + ids[pcie_i0[q]]);
+        }
         for (int q = 0; q < fetches; ++q) {       // the PCIe groups: staging slot q, entries after the VRAM ones
             const int64_t i0 = pcie_i0[q];
             P.ptr2[q] = P.pcie_mode != 0 ? (unsigned long long) d.src->device_alias(d.layers, ids[i0])
-                                 : P.staging + (unsigned long long) q * (unsigned long long) bb;
+                                 : P.staging + (unsigned long long) q * stride;
             P.start2[q] = entries;
             for (int64_t i = i0; i < n; ++i)
                 if (first_of[i] == i0) {

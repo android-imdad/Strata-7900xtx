@@ -10410,6 +10410,7 @@ int main(int argc, char** argv) {
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
         std::function<void()> adapt_fence;
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
+        int64_t adapt_kept = 0;     // ... of them copied from the PCIe staging ring (STRATA_PCIE_KEEP)
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
@@ -10524,9 +10525,17 @@ int main(int argc, char** argv) {
                     cst = adapt_stream2;
                     used2 = true;
                 }
+                // STRATA_PCIE_KEEP: a swap-in the last window fetched over PCIe is still in the staging ring - copied
+                // device to device (the same bytes; the next window's fetches start after this round has landed)
+                const uint8_t* kept = gs == nullptr && slot >= 0 && !adapt_fence ? ver.kept_blob(s.layer, s.in) : nullptr;
+                if (kept != nullptr) ++adapt_kept;
                 if (slot < 0 || b == nullptr ||
-                    adapt_copy_h2d(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
-                                   (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cst) != cudaSuccess) {
+                    (kept != nullptr
+                         ? cudaMemcpyAsync(xcache.device_slot(slot), kept,
+                                           (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer),
+                                           cudaMemcpyDeviceToDevice, cst)
+                         : adapt_copy_h2d(gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot), b,
+                                          (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), cst)) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: adaptive swap copy failed (layer %d, slot %d, pinned %d): %s\n",
                                  (int) s.layer, (int) slot, pin_live.empty() ? 0 : 1, cudaGetErrorString(cudaGetLastError()));
                     return false;
@@ -14357,7 +14366,7 @@ int main(int argc, char** argv) {
             drive.layer_wait_ms = 0;   // STRATA_ADAPT_LAYERWAIT's waits, this request
             long long n_swaps = 0, n_adapt = 0;
             double dt_adapt_wait = 0, dt_adapt_join = 0;   // the tier's wait before a window / join after the draft (ms, summed)
-            const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
+            const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps, dt_kept0 = adapt_kept;
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
@@ -15459,13 +15468,15 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata decode timing: %lld windows, avg T %.2f, %.2f tokens/window, %.2f ms/window = "
                                      "verify %.2f (GPU-reach wait %.2f + per-layer host %.2f [plan %.2f actq %.2f jobs %.2f "
                                      "CPU %.2f] + stage %.2f) + commit/emit %.2f + draft %.2f; per layer-window: CPU experts "
-                                     "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f; adapt wait %.2f join %.2f, %.1f swaps/window\n",
+                                     "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f; adapt wait %.2f join %.2f, %.1f swaps/window "
+                                     "(%.1f from the PCIe ring)\n",
                              (long long) dec_windows, dec_T / w, produced_n / w, decode_ms / w, dt_run / w,
                              (d1.wait - ds0.wait) / w, (d1.pool - ds0.pool) / w, (d1.plan - ds0.plan) / w,
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L),
-                             dt_adapt_wait / w, dt_adapt_join / w, (double) ((ajob ? a_swapped : adapt_nswaps) - dt_sw0) / w);
+                             dt_adapt_wait / w, dt_adapt_join / w, (double) ((ajob ? a_swapped : adapt_nswaps) - dt_sw0) / w,
+                             (double) (adapt_kept - dt_kept0) / w);
                 std::fprintf(stderr, "strata decode timing: between the windows (ms/window): adaptive copies waited %.2f "
                                      "(in the window's layers %.2f), "
                                      "adapt join %.2f (its round %.2f, %.1f swaps a round over %lld rounds), the rest %.2f\n",

@@ -497,6 +497,16 @@ struct TraceEv {
 constexpr uint64_t kTraceN = 4096;
 TraceEv g_trace_ring[kTraceN];
 std::atomic<uint64_t> g_trace_next{0};
+// STRATA_PCIE_KEEP=n: the PCIe share's staging ring (GpuPlanSink::ring), n blobs; 0 off, else at least 48 (a layer's
+// fetches take a contiguous run of at most 16, and a split window's two groups may hold two layers' runs at once)
+int64_t pcie_keep() {
+    static const int64_t n = [] {
+        const char* v = std::getenv("STRATA_PCIE_KEEP");
+        const int64_t k = v != nullptr ? std::atoll(v) : 0;
+        return k <= 0 ? (int64_t) 0 : std::max<int64_t>(k, 48);
+    }();
+    return n;
+}
 int64_t trace_now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
 }
@@ -912,7 +922,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
+        staging_ = b.take<uint8_t>((uint64_t) (kStagingBlobs + pcie_keep()) * strata::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
         nat_xr_ = had_gu_any ? b.take<float>(T * N) : nullptr;
@@ -991,6 +1001,16 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
+    if (const int64_t keep = pcie_keep(); keep > 0 && staging_ != nullptr) {   // the ring after the 16 slots
+        const int64_t mb = strata::kernels::cpu::expert_layout().max_blob;
+        ring_owner_.assign((size_t) keep, -1);
+        ring_n_expert_ = g.n_expert;
+        sink_.ring = (unsigned long long) (staging_ + (size_t) kStagingBlobs * (size_t) mb);
+        sink_.ring_stride = mb;
+        sink_.ring_cap = (int32_t) keep;
+        sink_.ring_cur = 0;
+        sink_.ring_owner = ring_owner_.data();
+    }
     (void) TS;
     // STRATA_PIPED_CONCURRENT=1 (opt-in): a prompt can run on the same GPU while the batch windows run, so the windows'
     // streams get the device's highest priority (HIP: the default priority, as the drafter's)
@@ -3355,6 +3375,14 @@ void Verifier::pcie_balance_window(int64_t steps, int G) {
     M.solve();
 }
 
+const uint8_t* Verifier::kept_blob(int64_t layer, int32_t expert) const {
+    if (next_ != nullptr || sink_.ring_cap <= 0 || ring_owner_.empty()) return nullptr;
+    const int32_t key = (int32_t) (layer * ring_n_expert_ + expert);
+    for (int32_t i = 0; i < sink_.ring_cap; ++i)
+        if (ring_owner_[(size_t) i] == key) return (const uint8_t*) (sink_.ring + (unsigned long long) i * sink_.ring_stride);
+    return nullptr;
+}
+
 void Verifier::set_plan_slot(int grp) {
     const int64_t cap = sink_.cap;
     int32_t* base = h_plan_ + (size_t) grp * (size_t) plan_i32_;
@@ -3398,13 +3426,17 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
     if (n <= 0) { v->raise_b(want); return; }
     v->copy_used_ = true;
     uint8_t* stage = (uint8_t*) v->sink_.staging;                  // this group's half in a split window
+    // STRATA_PCIE_KEEP: the ring's slots are max_blob apart (expert_source set staging to this layer's run of them)
+    const size_t stride = v->sink_.ring_cap > 0 ? (size_t) v->sink_.ring_stride : bytes;
     // STRATA_DMA_BATCH (midhatn's #807, F12): the group's independent uploads as one cudaMemcpyBatchAsync.  Mode 0 is
     // the loop the engine always ran, errors unchecked (it never stops the engine).  A batch mode whose uploads
     // cannot be submitted stops the engine: flag B must not release the consumers to expert weights that were never
     // copied.
     const int batch_mode = strata::core::dma_batch_mode();
     if (batch_mode == 0) {
-        for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * bytes, src[i], bytes, cudaMemcpyHostToDevice, v->copy_);
+        for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * stride, src[i], bytes, cudaMemcpyHostToDevice, v->copy_);
+    } else if (stride != bytes) {   // (a batch is contiguous)
+        for (int i = 0; i < n; ++i) cudaMemcpyAsync(stage + (size_t) i * stride, src[i], bytes, cudaMemcpyHostToDevice, v->copy_);
     } else {
         const auto copied = strata::core::copy_expert_blobs(stage, src, n, bytes, v->copy_, batch_mode);
         if (copied != cudaSuccess) {

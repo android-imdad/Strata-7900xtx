@@ -387,6 +387,14 @@ struct GpuPlanSink {
     /// holds the arena's device alias.
     int pcie_mode = 0;
     int32_t cpu_jobs = 0;   ///< host only: the distinct experts the pool computes for the layer just published
+    /// STRATA_PCIE_KEEP=n (DMA, pcie_mode 0): the PCIe share's blobs land in a ring of n staging slots `ring_stride`
+    /// apart instead of the reused slots 0.., so a window's fetched blobs stay on the device until the ring wraps;
+    /// `ring_owner[i]` (host) is the layer * n_expert + expert slot i holds (-1 none).  Verifier::kept_blob finds them
+    /// for the adaptive tier, which copies such a swap-in device to device.
+    unsigned long long ring = 0;
+    int64_t ring_stride = 0;
+    int32_t ring_cap = 0, ring_cur = 0;
+    int32_t* ring_owner = nullptr;
 };
 
 /// Verifier::set_pcie_balance: a verify window's costs, fitted to each layer's measured times (ms, least squares with

@@ -333,6 +333,9 @@ public:
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
     GpuPlanSink* plan_sink() { return &sink_; }
+    /// STRATA_PCIE_KEEP: the device copy of (layer, expert)'s blob a PCIe fetch left in the staging ring, or nullptr.
+    /// Valid between windows (every fetch of the last window has landed and been read).
+    const uint8_t* kept_blob(int64_t layer, int32_t expert) const;
     /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
     /// of the other (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }
@@ -644,6 +647,8 @@ private:
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
     static constexpr int64_t kStagingBlobs = 16;
+    std::vector<int32_t> ring_owner_;                             // STRATA_PCIE_KEEP: the staging ring's experts
+    int64_t ring_n_expert_ = 0;
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
