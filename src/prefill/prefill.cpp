@@ -3562,10 +3562,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-                    // in segments at the snapshot points (the recurrence is sequential: the same bits as one launch)
+                    // in segments at the snapshot points (the recurrence is sequential: the same bits as one launch).
+                    // kQkvC: the qkv row width - run()'s own `C` is the prompt chunk size (it shadows the width here)
+                    constexpr int64_t kQkvC = ::strata::prefill::C;
                     for (size_t k = 0, prev = 0; k <= snap_b.size(); ++k) {
                         const int64_t b = k < snap_b.size() ? snap_b[k] : T, a = (int64_t) prev;
-                        gdn_recurrence(state, m.hbuf + a * C, m.gate + a * HV, m.beta + a * HV, m.z + a * ZV,
+                        gdn_recurrence(state, m.hbuf + a * kQkvC, m.gate + a * HV, m.beta + a * HV, m.z + a * ZV,
                                        (const float*) wnm->data, EPS, m.y + a * ZV, m.y_h + a * (ld_y > 0 ? ld_y : ZV), b - a,
                                        m.cs, ld_y);
                         if (k < snap_b.size())
