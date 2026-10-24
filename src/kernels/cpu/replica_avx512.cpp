@@ -54,10 +54,29 @@ template <> struct Dec<21> {   // IQ3_S
     // the integer scale of part sb (0..7) of a block
     static inline int ls(const uint8_t* b, int sb) { return 1 + 2 * ((b[106 + sb / 2] >> (4 * (sb % 2))) & 0x0F); }
 };
+// IQ3_XXS: the grid by one vpgatherdd as IQ3_S, and the sign mask from the 7-bit fields by popcount
+// (ksigns_iq2xs[i] = i | parity(i) << 7, iq_avx512.cpp's sign_mask_from_idx) - the same table words and sign bytes.
+// STRATA_REPLICA_XXS=0 keeps the scalar loads and table lookups.
+const bool g_xxs_vec = [] {
+    const char* e = std::getenv("STRATA_REPLICA_XXS");
+#if defined(__GNUC__)
+    if (!__builtin_cpu_supports("avx512vpopcntdq")) return false;
+#endif
+    return !(e != nullptr && e[0] == '0');
+}();
 template <> struct Dec<18> {   // IQ3_XXS
     static constexpr int bytes = 98;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m) {
         const uint8_t* q = b + 2 + 16 * j;
+        if (g_xxs_vec) {
+            g = _mm512_i32gather_epi32(_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*) q)), (const void*) iq3xxs_grid, 4);
+            const uint32_t a = u32(b + 2 + 64 + 8 * j), c = u32(b + 2 + 64 + 8 * j + 4);
+            const __m256i w = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_set1_epi32((int) a)), _mm_set1_epi32((int) c), 1);
+            const __m256i si = _mm256_and_si256(_mm256_srlv_epi32(w, _mm256_setr_epi32(0, 7, 14, 21, 0, 7, 14, 21)), _mm256_set1_epi32(127));
+            const __m256i par = _mm256_slli_epi32(_mm256_and_si256(_mm256_popcnt_epi32(si), _mm256_set1_epi32(1)), 7);
+            m = _cvtu64_mask64((uint64_t) _mm_cvtsi128_si64(_mm256_cvtepi32_epi8(_mm256_or_si256(si, par))));
+            return;
+        }
         g = _mm512_set_epi32((int) iq3xxs_grid[q[15]], (int) iq3xxs_grid[q[14]], (int) iq3xxs_grid[q[13]], (int) iq3xxs_grid[q[12]],
                              (int) iq3xxs_grid[q[11]], (int) iq3xxs_grid[q[10]], (int) iq3xxs_grid[q[9]], (int) iq3xxs_grid[q[8]],
                              (int) iq3xxs_grid[q[7]], (int) iq3xxs_grid[q[6]], (int) iq3xxs_grid[q[5]], (int) iq3xxs_grid[q[4]],
