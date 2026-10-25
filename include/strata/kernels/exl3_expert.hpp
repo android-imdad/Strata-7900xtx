@@ -20,10 +20,11 @@
 // sum rounded on its own), divisions IEEE, round = half away from zero.  For one token and one matrix:
 //   1. u_i = x_i * suh_i;  xh = H(u) per 128-block: butterflies at strides 1, 2, 4, ..., 64, each (a + b, a - b) with a
 //      the lower index.
-//   2. per 128-block j: amax_j = max |xh| (any order: max is exact); d_j = amax_j / 127; q = clamp(round(xh / d_j),
-//      -127, 127) as int8 (d_j = 0: q = 0).  Q_j = sum of the block's q (exact int).
-//   3. per output c and block j: I_jc = sum over the block's 128 inputs of q_i * s_ic (exact int32, |I| < 2^24, so
-//      exact in FP32 too).
+//   2. per 128-block j: amax_j = max |xh| (any order: max is exact); d_j = amax_j / QM; q = clamp(round(xh / d_j),
+//      -QM, QM) (d_j = 0: q = 0).  Q_j = sum of the block's q (exact int).  QM = act_qmax(): 127 (int8, ~1% expert
+//      error) or 16383 (Q15, ~0.01%; STRATA_EXL3_ACT=15).
+//   3. per output c and block j: I_jc = sum over the block's 128 inputs of q_i * s_ic (exact int32: |I| <= 128 QM 1020
+//      < 2^31; (float) I rounds to nearest even - exact for int8 - the same on every device).
 //   4. acc_c = sum over j = 0, 1, ... of (d_j * I_jc), left to right;  qs = sum over j of (d_j * Q_j), left to right;
 //      y'_c = A * acc_c + B * qs.
 //   5. y = H(y') per 128-block of outputs (as in 1), then y_c = (y_c * (1/128)) * svh_c.
@@ -34,6 +35,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace strata::kernels::exl3 {
 
@@ -46,6 +48,13 @@ constexpr int k2_of(int type) {
     return (k2 >= 2 && k2 <= 16 && (k2 % 2 == 0 || k2 <= 7)) ? k2 : 0;
 }
 constexpr bool is_exl3(int type) { return k2_of(type) != 0; }
+
+/// The activations' integer range QM (exl3_expert.hpp step 2): STRATA_EXL3_ACT=15 -> 16383 (Q15), else 127 (int8).
+/// Read once; the CPU rows and the GPU groups both use it, so they keep the same bits.
+inline int act_qmax() {
+    static const int q = [] { const char* v = std::getenv("STRATA_EXL3_ACT"); return v && std::atoi(v) == 15 ? 16383 : 127; }();
+    return q;
+}
 
 constexpr uint32_t kMul1 = 0x83DCD12Du;
 /// The codebook's affine form w' = A s + B: A = fp16(0x1eee), B = 1024 A + fp16(0xc931) (both exact in FP32).

@@ -84,7 +84,9 @@ void prep_avx512(const Mat& m, const float* x, Act& a) {
         __m512 am = _mm512_and_ps(v[0], absm);
         for (int i = 1; i < 8; ++i) am = _mm512_max_ps(am, _mm512_and_ps(v[i], absm));
         const float amax = _mm512_reduce_max_ps(am);
-        const float d = amax / 127.0f;
+        const int qm = exl3::act_qmax();
+        const float qmf = (float) qm;
+        const float d = amax / qmf;
         __m512i qsum = _mm512_setzero_si512();
         for (int i = 0; i < 8; ++i) {
             __m512 r = _mm512_setzero_ps();
@@ -95,13 +97,14 @@ void prep_avx512(const Mat& m, const float* x, Act& a) {
                 const __mmask16 up = _mm512_cmp_ps_mask(fr, _mm512_set1_ps(0.5f), _CMP_GE_OQ);
                 const __m512 one = _mm512_or_ps(_mm512_set1_ps(1.0f), _mm512_andnot_ps(absm, t));
                 r = _mm512_mask_add_ps(tr, up, tr, one);
-                r = _mm512_min_ps(_mm512_max_ps(r, _mm512_set1_ps(-127.0f)), _mm512_set1_ps(127.0f));
+                r = _mm512_min_ps(_mm512_max_ps(r, _mm512_set1_ps(-qmf)), _mm512_set1_ps(qmf));
             }
             const __m512i qi = _mm512_cvtps_epi32(r);
             qsum = _mm512_add_epi32(qsum, qi);
-            _mm_storeu_si128(reinterpret_cast<__m128i*>(a.q + 128 * j + 16 * i), _mm512_cvtsepi32_epi8(qi));
-            _mm512_storeu_si512(a.q4 + 128 * j + 16 * i, _mm512_mullo_epi32(_mm512_and_si512(qi, _mm512_set1_epi32(0xFF)),
-                                                                           _mm512_set1_epi32(0x01010101)));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(a.q + 128 * j + 16 * i), _mm512_cvtsepi32_epi16(qi));
+            _mm512_storeu_si512(a.q4 + 128 * j + 16 * i,
+                                qm == 127 ? _mm512_mullo_epi32(_mm512_and_si512(qi, _mm512_set1_epi32(0xFF)), _mm512_set1_epi32(0x01010101))
+                                          : _mm512_and_si512(qi, _mm512_set1_epi32(0xFFFF)));
         }
         a.d[j] = d;
         qs = qs + d * (float) _mm512_reduce_add_epi32(qsum);
@@ -115,6 +118,8 @@ void block_avx512(const Mat& m, const Act* const* a, int nt, int b, float* const
     const __mmask64 hi_mask = tile_bytes > 64 ? (~0ull >> (128 - tile_bytes)) : 0;
     const __m512i bswap = _mm512_set4_epi32(0x0C0D0E0F, 0x08090A0B, 0x04050607, 0x00010203);
     const __m512i mul1 = _mm512_set1_epi32((int) exl3::kMul1), lo16 = _mm512_set1_epi32(0xFFFF);
+    const __m512i ones = _mm512_set1_epi32(0x01010101);
+    const bool q15 = exl3::act_qmax() != 127;
     alignas(64) float acc[8][8][16];   // [token][tile column][lane]
     alignas(64) int32_t I[8][8][16];
     for (int t = 0; t < nt; ++t)
@@ -136,11 +141,21 @@ void block_avx512(const Mat& m, const Act* const* a, int nt, int b, float* const
                     const __m512i st = _mm512_and_si512(_mm512_srlv_epi32(d, _mm512_load_si512(shr[r])), lo16);
                     w[r] = _mm512_mullo_epi32(st, mul1);
                 }
-                for (int t = 0; t < nt; ++t) {
-                    const int32_t* q4 = a[t]->q4 + 16 * tk;
-                    __m512i s = _mm512_load_si512(I[t][tc]);
-                    for (int r = 0; r < 16; ++r) s = _mm512_dpbusd_epi32(s, w[r], _mm512_set1_epi32(q4[r]));
-                    _mm512_store_si512(I[t][tc], s);
+                if (q15) {   // the codebook index explicitly (its four bytes summed), then s q by one vpdpwssd per token
+                    for (int r = 0; r < 16; ++r) w[r] = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w[r], ones);
+                    for (int t = 0; t < nt; ++t) {
+                        const int32_t* q4 = a[t]->q4 + 16 * tk;
+                        __m512i s = _mm512_load_si512(I[t][tc]);
+                        for (int r = 0; r < 16; ++r) s = _mm512_dpwssd_epi32(s, w[r], _mm512_set1_epi32(q4[r]));   // s q + 0 * 0
+                        _mm512_store_si512(I[t][tc], s);
+                    }
+                } else {
+                    for (int t = 0; t < nt; ++t) {
+                        const int32_t* q4 = a[t]->q4 + 16 * tk;
+                        __m512i s = _mm512_load_si512(I[t][tc]);
+                        for (int r = 0; r < 16; ++r) s = _mm512_dpbusd_epi32(s, w[r], _mm512_set1_epi32(q4[r]));
+                        _mm512_store_si512(I[t][tc], s);
+                    }
                 }
             }
         }

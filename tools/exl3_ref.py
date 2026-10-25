@@ -123,14 +123,17 @@ def round_away(t: np.ndarray) -> np.ndarray:
     return np.where(fr >= F(0.5), tr + np.copysign(F(1.0), t), tr).astype(F)
 
 
+QMAX = 127   # the activations' range: 127 (int8) or 16383 (Q15, --act 15)
+
+
 def quant128(xh: np.ndarray):
-    """int8 q, FP32 d per 128-block, Q per block."""
+    """integer q in [-QMAX, QMAX], FP32 d per 128-block, Q per block."""
     v = xh.reshape(-1, 128)
     amax = np.abs(v).max(axis=1).astype(F)
-    d = (amax / F(127.0)).astype(F)
+    d = (amax / F(QMAX)).astype(F)
     with np.errstate(divide="ignore", invalid="ignore"):
         t = np.where(d[:, None] > 0, v / d[:, None], F(0.0)).astype(F)
-    q = np.clip(round_away(t), -127, 127).astype(np.int32)
+    q = np.clip(round_away(t), -QMAX, QMAX).astype(np.int64)
     return q, d, q.sum(axis=1)
 
 
@@ -140,7 +143,7 @@ def matvec_ref(x: np.ndarray, s: np.ndarray, suh: np.ndarray, svh: np.ndarray) -
     u = (x.astype(F) * suh.astype(F)).astype(F)
     q, d, Q = quant128(had128(u))
     I = np.einsum("ji,jic->jc", q.astype(np.int64), s.reshape(k // 128, 128, n).astype(np.int64))
-    assert np.abs(I).max() < 2 ** 24
+    assert np.abs(I).max() < 2 ** 31
     acc = np.zeros(n, F)
     qs = F(0.0)
     for j in range(k // 128):
@@ -232,11 +235,14 @@ def main() -> int:
     ap.add_argument("--layers", default="0,4")
     ap.add_argument("--experts", type=int, default=2)
     ap.add_argument("--golden", action="store_true")
+    ap.add_argument("--act", type=int, default=8, choices=(8, 15), help="activation range: int8 or Q15 (STRATA_EXL3_ACT)")
     ap.add_argument("--dequant-check", nargs=2, metavar=("LAYER:EXPERT", "BIN"),
                     help="compare exl3_dequant_check's FP16 output with the float64 weight")
     ap.add_argument("--fixture", type=pathlib.Path, help="write x, h and y of --experts per layer, 2 inputs each, "
                     "for exl3_cpu_parity / exl3_replica")
     a = ap.parse_args()
+    global QMAX
+    QMAX = 16383 if a.act == 15 else 127
     pack = Pack(a.pack)
     layers = [int(x) for x in a.layers.split(",")]
     if a.golden:
@@ -275,7 +281,7 @@ def main() -> int:
                     y = matvec_ref(h, ss[2], parts[2][1], parts[2][2])
                     recs.append(np.array([l, e2], np.int32).tobytes() + x.tobytes() + h.tobytes() + y.tobytes())
             print("fixture: layer %d done" % l, flush=True)
-        a.fixture.write_bytes(np.array([len(recs), pack.H, pack.FF], np.int32).tobytes() + b"".join(recs))
+        a.fixture.write_bytes(np.array([len(recs), pack.H, pack.FF, QMAX], np.int32).tobytes() + b"".join(recs))
         print("wrote %s: %d records" % (a.fixture, len(recs)))
         return 0
     for l in layers:

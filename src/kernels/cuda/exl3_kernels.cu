@@ -142,8 +142,8 @@ struct EntLay {
     size_t qg, qu, qd, dg, du, dd, Qg, Qu, Qd, qs, h, ypg, ypu, ypd, bytes;
     __host__ __device__ EntLay(int64_t H, int64_t F) {
         auto al = [](size_t v, size_t a) { return (v + a - 1) / a * a; };
-        qg = 0; qu = (size_t) H; qd = 2 * (size_t) H;
-        dg = al(qd + (size_t) F, 16); du = dg + 4 * (size_t) (H / 128); dd = du + 4 * (size_t) (H / 128);
+        qg = 0; qu = 2 * (size_t) H; qd = 4 * (size_t) H;   // int16 values (int8 or Q15 range)
+        dg = al(qd + 2 * (size_t) F, 16); du = dg + 4 * (size_t) (H / 128); dd = du + 4 * (size_t) (H / 128);
         Qg = dd + 4 * (size_t) (F / 128); Qu = Qg + 4 * (size_t) (H / 128); Qd = Qu + 4 * (size_t) (H / 128);
         qs = Qd + 4 * (size_t) (F / 128);
         h = al(qs + 12, 16);
@@ -206,7 +206,7 @@ __global__ void group_map_kernel(const int32_t* grp_start, const int32_t* n_grou
 __global__ void __launch_bounds__(128) prep_kernel(const unsigned long long* grp_ptr, const int32_t* grp_start,
                                                    const int32_t* n_groups, int64_t cap_groups, const int32_t* ent_tok,
                                                    const int32_t* ent_grp, const float* x, uint8_t* scratch, int H, int F,
-                                                   int gk2, int dk2, int role0) {
+                                                   int gk2, int dk2, int role0, int qm) {
     const int e = blockIdx.x, role = role0 + (int) blockIdx.y, j = blockIdx.z, i = threadIdx.x;
     const int ng = (int) min<int64_t>(*n_groups, cap_groups);
     if (e < grp_start[0] || e >= grp_start[ng]) return;   // a PCIe pass's entries follow the VRAM pass's
@@ -225,11 +225,12 @@ __global__ void __launch_bounds__(128) prep_kernel(const unsigned long long* grp
         if (i < s) red[i] = fmaxf(red[i], red[i + s]);
         __syncthreads();
     }
-    const float d = red[0] / 127.0f;
+    const float qmf = (float) qm;
+    const float d = red[0] / qmf;
     float q = d > 0.f ? round_away(v / d) : 0.f;
-    q = fminf(fmaxf(q, -127.f), 127.f);
+    q = fminf(fmaxf(q, -qmf), qmf);
     const size_t qo = role == 0 ? L.qg : role == 1 ? L.qu : L.qd;
-    reinterpret_cast<int8_t*>(es + qo)[128 * j + i] = (int8_t) q;
+    reinterpret_cast<int16_t*>(es + qo)[128 * j + i] = (int16_t) q;
     ired[i] = (int) q;
     __syncthreads();
     for (int s = 64; s > 0; s >>= 1) {
@@ -259,7 +260,7 @@ __global__ void qs_kernel(const int32_t* grp_start, const int32_t* n_groups, int
 }
 
 // output column c (thread) of block b of one role: steps 3-5, before the svh scale
-__device__ __forceinline__ float matvec_col(const RoleView& m, const int8_t* q, const float* d, float qs, int b, float* sh) {
+__device__ __forceinline__ float matvec_col(const RoleView& m, const int16_t* q, const float* d, float qs, int b, float* sh) {
     const int c = 128 * b + (int) threadIdx.x;
     const int tn = c >> 4, cc = c & 15;
     const size_t tile_bytes = 16u * (size_t) m.K2;
@@ -289,10 +290,10 @@ __global__ void __launch_bounds__(128) gu_kernel(const unsigned long long* grp_p
     const uint8_t* blob = reinterpret_cast<const uint8_t*>(grp_ptr[ent_grp[e]]);
     __shared__ float sh[128];
     const float* qs = reinterpret_cast<const float*>(es + L.qs);
-    const float g = matvec_col(role_view(blob, 0, H, F, gk2, dk2), reinterpret_cast<const int8_t*>(es + L.qg),
+    const float g = matvec_col(role_view(blob, 0, H, F, gk2, dk2), reinterpret_cast<const int16_t*>(es + L.qg),
                                reinterpret_cast<const float*>(es + L.dg), qs[0], b, sh);
     __syncthreads();
-    const float u = matvec_col(role_view(blob, 1, H, F, gk2, dk2), reinterpret_cast<const int8_t*>(es + L.qu),
+    const float u = matvec_col(role_view(blob, 1, H, F, gk2, dk2), reinterpret_cast<const int16_t*>(es + L.qu),
                                reinterpret_cast<const float*>(es + L.du), qs[1], b, sh);
     reinterpret_cast<float*>(es + L.h)[128 * b + threadIdx.x] = (g / (1.0f + strata::kernels::sexp(-g))) * u;
 }
@@ -309,7 +310,7 @@ __global__ void __launch_bounds__(128) down_kernel(const unsigned long long* grp
     uint8_t* es = scratch + (size_t) e * L.bytes;
     const uint8_t* blob = reinterpret_cast<const uint8_t*>(grp_ptr[ent_grp[e]]);
     __shared__ float sh[128];
-    const float y = matvec_col(role_view(blob, 2, H, F, gk2, dk2), reinterpret_cast<const int8_t*>(es + L.qd),
+    const float y = matvec_col(role_view(blob, 2, H, F, gk2, dk2), reinterpret_cast<const int16_t*>(es + L.qd),
                                reinterpret_cast<const float*>(es + L.dd), reinterpret_cast<const float*>(es + L.qs)[2], b, sh);
     out[(size_t) ent_dst[e] * (size_t) H + (size_t) (128 * b) + threadIdx.x] = y;
 }
@@ -373,10 +374,11 @@ __global__ void __launch_bounds__(128) band_v2_kernel(const unsigned long long* 
                 s[i] = (int) ((x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + (x >> 24));
             }
             for (int t = 0; t < nt; ++t) {
-                const int8_t* q = reinterpret_cast<const int8_t*>(scratch + (size_t) (e0 + t) * L.bytes + qo) + 16 * tk + 8 * h;
-                const uint64_t q8 = *reinterpret_cast<const uint64_t*>(q);
+                const int16_t* q = reinterpret_cast<const int16_t*>(scratch + (size_t) (e0 + t) * L.bytes + qo) + 16 * tk + 8 * h;
+                const uint4 qv = *reinterpret_cast<const uint4*>(q);   // 8 int16, 16-byte aligned
+                const uint32_t qw[4] = {qv.x, qv.y, qv.z, qv.w};
                 int32_t a = I[t];
-                for (int i = 0; i < 8; ++i) a += (int32_t) (int8_t) (q8 >> (8 * i)) * s[i];
+                for (int i = 0; i < 8; ++i) a += (int32_t) (int16_t) (qw[i >> 1] >> (16 * (i & 1))) * s[i];
                 I[t] = a;
             }
         }
@@ -483,13 +485,13 @@ void exl3_expert_grouped(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, 
     const int cap = (int) cap_entries;
     group_map_kernel<<<1, 256, 0, s>>>(grp_start, n_groups, cap_groups, ent_grp);
     prep_kernel<<<dim3(cap, 2, H / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_tok, ent_grp, x, sc,
-                                                      H, F, gk2, dk2, 0);
+                                                      H, F, gk2, dk2, 0, ex::act_qmax());
     qs_kernel<<<dim3(cap, 2), 32, 0, s>>>(grp_start, n_groups, cap_groups, sc, H, F, 0);
     if (!v1_path()) {   // v2 (default): the bands a wave each, then the output rotations
         band(gk2, cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, 0, s);
         gu_post_kernel<<<dim3(cap, F / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_grp, sc, H, F, gk2, dk2);
         prep_kernel<<<dim3(cap, 1, F / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_tok, ent_grp, x, sc,
-                                                          H, F, gk2, dk2, 2);
+                                                          H, F, gk2, dk2, 2, ex::act_qmax());
         qs_kernel<<<dim3(cap, 1), 32, 0, s>>>(grp_start, n_groups, cap_groups, sc, H, F, 2);
         band(dk2, cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, 2, s);
         down_post_kernel<<<dim3(cap, H / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_grp, ent_dst, sc,
@@ -503,7 +505,7 @@ void exl3_expert_grouped(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, 
     }
     gu_kernel<<<dim3(cap, F / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_grp, sc, H, F, gk2, dk2);
     prep_kernel<<<dim3(cap, 1, F / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_tok, ent_grp, x, sc,
-                                                      H, F, gk2, dk2, 2);
+                                                      H, F, gk2, dk2, 2, ex::act_qmax());
     qs_kernel<<<dim3(cap, 1), 32, 0, s>>>(grp_start, n_groups, cap_groups, sc, H, F, 2);
     down_kernel<<<dim3(cap, H / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_grp, ent_dst, sc, out,
                                                    H, F, gk2, dk2);

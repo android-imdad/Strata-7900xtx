@@ -123,13 +123,16 @@ void prep(const Mat& m, const float* x, Act& a) {
         had128(v);
         float amax = 0.f;
         for (int i = 0; i < 128; ++i) amax = std::fmax(amax, std::fabs(v[i]));
-        const float d = amax / 127.0f;
+        const int qm = exl3::act_qmax();
+        const float qmf = (float) qm;
+        const float d = amax / qmf;
         int Q = 0;
         for (int i = 0; i < 128; ++i) {
             float q = d > 0.f ? round_away(v[i] / d) : 0.f;
-            q = std::fmin(std::fmax(q, -127.f), 127.f);
-            a.q[128 * j + i] = (int8_t) q;
-            a.q4[128 * j + i] = (int32_t) (((uint32_t) (uint8_t) (int8_t) q) * 0x01010101u);
+            q = std::fmin(std::fmax(q, -qmf), qmf);
+            a.q[128 * j + i] = (int16_t) q;
+            a.q4[128 * j + i] = qm == 127 ? (int32_t) (((uint32_t) (uint8_t) (int8_t) q) * 0x01010101u)
+                                          : (int32_t) ((uint32_t) (uint16_t) (int16_t) q);
             Q += (int) q;
         }
         a.d[j] = d;
@@ -153,7 +156,7 @@ void block(const Mat& m, const Act* const* a, int nt, int b, float* const* y) {
                 decode_tile(reinterpret_cast<const uint32_t*>(m.trellis + ((size_t) tk * tn_per + tn) * tile_bytes),
                             m.K2, s);
                 for (int t = 0; t < nt; ++t) {
-                    const int8_t* q = a[t]->q + 16 * tk;
+                    const int16_t* q = a[t]->q + 16 * tk;
                     for (int r = 0; r < 16; ++r)
                         for (int c = 0; c < 16; ++c) I[t][16 * tc + c] += (int32_t) q[r] * s[r][c];
                 }

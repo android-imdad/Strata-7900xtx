@@ -80,9 +80,14 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::ifstream fx(argv[2], std::ios::binary);
-    int32_t head[3];
+    int32_t head[4];
     if (!fx.read(reinterpret_cast<char*>(head), sizeof head)) { std::fprintf(stderr, "bad fixture\n"); return 2; }
     const int nrec = head[0], H = head[1], FF = head[2];
+    if (head[3] != strata::kernels::exl3::act_qmax()) {
+        std::fprintf(stderr, "the fixture was made for activations up to %d, this run uses %d (STRATA_EXL3_ACT)\n", head[3],
+                     strata::kernels::exl3::act_qmax());
+        return 2;
+    }
     std::vector<Rec> recs((size_t) nrec);
     for (auto& r : recs) {
         int32_t le[2];
