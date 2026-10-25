@@ -13,14 +13,16 @@
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest activation any native layer takes: 2560 values as Q8_K (10 x 292), or as F32 for an EXL3 layer
+/// (exl3_cpu.hpp: each expert rotates and quantizes it with its own scales).
+inline constexpr size_t kNativeActBytes = 10240;
+/// Bytes of the largest down activation (640 values as Q8_0: 20 x 34, Q8_K 3 x 292, or F32 for EXL3).
+inline constexpr size_t kNativeHBytes = 2560;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
-    int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
+    int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down (or EXL3 ids, exl3_expert.hpp)
+    int exl3_gu = 0, exl3_d = 0;        ///< EXL3 layers: 2 K of gate/up and of down (0: not EXL3); activations are F32
     int gu_act = -1, d_act = -1;        ///< their vec_dot_type (the activation formats)
     int64_t n_embd = 0, n_ff = 0;
     size_t gu_row = 0, d_row = 0;       ///< bytes per weight row
@@ -32,6 +34,13 @@ struct NativeFmt {
     /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden
     /// drops to ~1e-5 and its q8 block scale becomes an FP16 subnormal (expert error 2-12% instead of 1.1%).
     size_t tail_off = 0;
+    /// prism.hadamard (hadamard.hpp): the experts of this layer are stored in a rotated basis, and
+    /// native_quant_act / native_quant_h apply y = H_block (signs * x) before quantizing.  had_block 0 = none.
+    int had_block = 0;
+    bool had_gu = false, had_d = false;
+    int layer = -1;                     ///< the layer this format belongs to (set by expert_layout_load; STRATA_ACT_DUMP only)
+    const float* gu_signs = nullptr;    ///< n_embd signs for x (nullptr: identity)
+    const float* d_signs = nullptr;     ///< n_ff signs for h (nullptr: identity)
 };
 constexpr int kNvfp4Type = 40;
 constexpr size_t kNvfp4Tail = 16;
@@ -49,9 +58,9 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 bool cpu_parity_init(bool gpu_sexp, std::string& why);
 bool cpu_parity() noexcept;
 
-/// x (n_embd floats) -> the gate/up activation (act_bytes).
+/// x (n_embd floats) -> the gate/up activation (act_bytes), rotated first when the layer is Hadamard-folded.
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
-/// h (n_ff floats) -> the down activation (h_bytes).
+/// h (n_ff floats) -> the down activation (h_bytes), rotated first when the layer is Hadamard-folded.
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 
 /// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
