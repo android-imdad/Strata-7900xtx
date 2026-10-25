@@ -6,6 +6,7 @@
 // the parity arithmetic (FP16 activations): the two differ by rounding (~1e-3 relative); a wrong decode, fragment or
 // rotation shows as O(1).  16 experts of one layer, row counts 1..300 at non-contiguous offsets, real activations
 // (the fixture's inputs).  --bench: us per group.
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -78,7 +79,11 @@ int main(int argc, char** argv) {
         fx.seekg(4 * (F + H), std::ios::cur);
     }
     const int NE = 16;
-    const int cnts[NE] = {1, 2, 5, 16, 17, 31, 64, 65, 100, 127, 128, 129, 200, 250, 3, 300};
+    int cnts[NE] = {1, 2, 5, 16, 17, 31, 64, 65, 100, 127, 128, 129, 200, 250, 3, 300};
+    if (const char* v = std::getenv("STRATA_PFC_AVG")) {   // (bench) row counts spread around an average: 0.25..1.75 x
+        const int avg = std::atoi(v);
+        for (int e = 0; e < NE; ++e) cnts[e] = std::max(1, avg / 4 + (int) ((3.0 * avg / 2.0) * ((e * 7 + 3) % NE) / (NE - 1)));
+    }
     strata::kernels::Exl3PfGroup g{};
     g.n = NE;
     int rows = 0;

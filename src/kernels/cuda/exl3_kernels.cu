@@ -1444,14 +1444,20 @@ __device__ __forceinline__ h16 load_a(const __half* p) {   // 16 consecutive hal
 
 // gate/up: a block (8 waves) per (expert, 64-row chunk, 128 outputs of each role); wave w: role w / 4, tile columns
 // 2 (w % 4) + {0, 1} of the 8; a half-wave decodes one tile (a lane a column), the halves swapped for the other's
+#ifndef STRATA_PF_WPE_GU
+#define STRATA_PF_WPE_GU 1
+#endif
+#ifndef STRATA_PF_WPE_D
+#define STRATA_PF_WPE_D 1
+#endif
 template <int K2>
-__global__ void __launch_bounds__(256) gemm_gu_kernel(Exl3PfGroup g, int gk2, int dk2, const float* __restrict__ Dm,
+__global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(STRATA_PF_WPE_GU))) gemm_gu_kernel(Exl3PfGroup g, int gk2, int dk2, const float* __restrict__ Dm,
                                                       const float* __restrict__ rs, float* GU) {
     const int lane = (int) (threadIdx.x & 31), wave = (int) (threadIdx.x >> 5);
     const int ob = (int) blockIdx.x % (F / 128), mcg = (int) blockIdx.x / (F / 128);
     if (mcg >= g.mc0[g.n]) return;
     const int e = expert_of_mc(g, mcg), row0 = MC * (mcg - g.mc0[e]), nrow = min(MC, g.cnt[e] - row0);
-    const int role = wave >> 2, tt = lane >> 4;
+    const int role = wave >> 2, tt = lane >> 4, nms = (nrow + 15) / 16;
     const int tn = 8 * ob + 2 * (wave & 3) + tt;
     const RoleView m = role_view(g.blob[e], role, H, F, gk2, dk2);
     const size_t kstep = (size_t) (F / 16) * (size_t) (4 * K2);
@@ -1468,9 +1474,13 @@ __global__ void __launch_bounds__(256) gemm_gu_kernel(Exl3PfGroup g, int gk2, in
     uint32_t w0[3], w1[3];
     v4::load3(wp, w0);
     v4::load3(wp + kstep, w1);
+#ifndef STRATA_PF_EXP
+#define STRATA_PF_EXP 0
+#endif
     auto step = [&](int kt, uint32_t (&w)[3]) {
         uint32_t Bm[8];
-        tile_column<K2>(w, lane, Bm);
+        if constexpr (STRATA_PF_EXP == 1) { for (int i = 0; i < 8; ++i) Bm[i] = w[i % 3] | 0x64006400u; }   // (exp: no decode)
+        else tile_column<K2>(w, lane, Bm);
         v4::load3(wp + (size_t) min(kt + 2, H / 16 - 1) * kstep, w);
         uint32_t ba[8], bb[8];
 #pragma unroll
@@ -1483,7 +1493,8 @@ __global__ void __launch_bounds__(256) gemm_gu_kernel(Exl3PfGroup g, int gk2, in
         const h16 BB = __builtin_bit_cast(h16, u8v{bb[0], bb[1], bb[2], bb[3], bb[4], bb[5], bb[6], bb[7]});
 #pragma unroll
         for (int ms = 0; ms < 4; ++ms) {
-            const h16 A = load_a(xa[ms] + 16 * kt);
+            if (ms >= nms) break;   // the chunk's rows end: no products for empty 16-row tiles (wave-uniform)
+            const h16 A = STRATA_PF_EXP == 2 ? BA : load_a(xa[ms] + 16 * kt);   // (exp 2: no A loads)
             acc[ms][0] = wmma(A, BA, acc[ms][0]);
             acc[ms][1] = wmma(A, BB, acc[ms][1]);
         }
@@ -1551,14 +1562,14 @@ __global__ void __launch_bounds__(256) gu_post_kernel(Exl3PfGroup g, const float
 // down: a block (4 waves) per (expert, 64-row chunk, 128 outputs); wave w tile columns 2 w + {0, 1}; the output side
 // (H over the 128, svh / 128) through LDS
 template <int K2>
-__global__ void __launch_bounds__(128) gemm_d_kernel(Exl3PfGroup g, int gk2, int dk2, const __half* __restrict__ Hh,
+__global__ void __launch_bounds__(128) __attribute__((amdgpu_waves_per_eu(STRATA_PF_WPE_D))) gemm_d_kernel(Exl3PfGroup g, int gk2, int dk2, const __half* __restrict__ Hh,
                                                      const float* __restrict__ rs, float* Dm) {
     __shared__ float ys[MC][128 + 1];
     const int lane = (int) (threadIdx.x & 31), wave = (int) (threadIdx.x >> 5);
     const int ob = (int) blockIdx.x % (H / 128), mcg = (int) blockIdx.x / (H / 128);
     if (mcg >= g.mc0[g.n]) return;
     const int e = expert_of_mc(g, mcg), row0 = MC * (mcg - g.mc0[e]), nrow = min(MC, g.cnt[e] - row0);
-    const int tt = lane >> 4, tn = 8 * ob + 2 * wave + tt;
+    const int tt = lane >> 4, tn = 8 * ob + 2 * wave + tt, nms = (nrow + 15) / 16;
     const RoleView m = role_view(g.blob[e], 2, H, F, gk2, dk2);
     const size_t kstep = (size_t) (H / 16) * (size_t) (4 * K2);
     const uint32_t* wp = reinterpret_cast<const uint32_t*>(m.trellis) + (size_t) tn * (4 * K2) + (size_t) ((K2 * ((lane & 15) & 7)) / 2);
@@ -1589,6 +1600,7 @@ __global__ void __launch_bounds__(128) gemm_d_kernel(Exl3PfGroup g, int gk2, int
         const h16 BB = __builtin_bit_cast(h16, u8v{bb[0], bb[1], bb[2], bb[3], bb[4], bb[5], bb[6], bb[7]});
 #pragma unroll
         for (int ms = 0; ms < 4; ++ms) {
+            if (ms >= nms) break;
             const h16 A = load_a(xa[ms] + 16 * kt);
             acc[ms][0] = wmma(A, BA, acc[ms][0]);
             acc[ms][1] = wmma(A, BB, acc[ms][1]);

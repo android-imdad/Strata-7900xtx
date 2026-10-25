@@ -4930,6 +4930,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                               lay.fmt[(size_t) l].n_embd, lay.fmt[(size_t) l].n_ff) &&
                                            m.pf_rs != nullptr && N == 2560;
                         const int px_max = std::min(16, DQ + dq_sets() * gu_exact_group());
+                        // the streamed walk (a ring far larger than a group): a streamed blob is read in its ring slot,
+                        // the group's slots released by one event at the flush and handed back to the issuer only then
+                        // (else a copy into dq_gu[i] frees the slot at once)
+                        const bool px_direct = stream_all && m.ring >= 8 * px_max;
+                        int px_slots[16];
+                        int px_nslots = 0;
                         auto px_flush = [&]() {
                             if (px.n == 0) return;
                             pt.mark(kPfGemmGU, cs);
@@ -4937,6 +4943,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             strata::kernels::exl3_pf_group(f.gu_type, f.d_type, f.n_embd, f.n_ff, px, m.Xs, m.GU, m.Hh, m.Dm,
                                                            m.pf_rs, m.cs);
                             px = strata::kernels::Exl3PfGroup{};
+                            if (px_nslots > 0) {
+                                const int rel = px_slots[px_nslots - 1];
+                                cudaEventRecord(m.used[rel], m.cs);
+                                for (int i = 0; i < px_nslots; ++i) { m.used_of[px_slots[i]] = rel; m.used_bid[px_slots[i]] = 0; }
+                                px_nslots = 0;
+                            }
                         };
                         // STRATA_PF_GU_EXACT: the deferred experts (their dequantized buffers DQ.. stay theirs until the flush)
                         GuExactGroup gx;
@@ -5241,9 +5253,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                             if (px_on) {   // STRATA_PF_EXL3_FUSED: into the open group
+                                bool held = false;
                                 if (ne > 0) {
                                     const uint8_t* bp = blob_dev;
-                                    if (slot >= 0) {   // streamed: its own copy, so the staging slot goes back now
+                                    if (slot >= 0 && px_direct) {   // read in its ring slot, released at the flush
+                                        px_slots[px_nslots++] = slot;
+                                        held = true;
+                                    } else if (slot >= 0) {   // streamed: its own copy, so the staging slot goes back now
                                         pt.mark(kPfDequant, cs);
                                         uint8_t* dst = reinterpret_cast<uint8_t*>(m.dq_gu[px.n]);
                                         cudaMemcpyAsync(dst, blob_dev, (size_t) lay.blob_bytes(l), cudaMemcpyDeviceToDevice, m.cs);
@@ -5254,7 +5270,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     px.cnt[px.n] = (int32_t) ne;
                                     ++px.n;
                                 }
-                                if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; m.used_bid[slot] = 0; }
+                                if (slot >= 0 && !held) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; m.used_bid[slot] = 0; }
                                 if (px.n == px_max) px_flush();
                                 return true;
                             }
@@ -5349,6 +5365,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t kend = seq_start[(size_t) l + 1];
                             auto release_to = [&](int32_t e_stop) {
                                 while (k < kend && seq[k].e < e_stop) {
+                                    if (px_nslots > 0) px_flush();   // STRATA_PF_EXL3_FUSED: likewise
                                     if (gg_nslots > 0) flush(0);   // the open group's slots get their event first
                                     const int sl = (int) (k % (size_t) m.ring);
                                     cudaEventRecord(m.used[sl], m.cs);
@@ -5370,7 +5387,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     }
                                     if (!compute(j, m.stage_dev[sl], sl, -1)) return false;
                                     consumed = ++k;
-                                    if (!group_gather || gg_nslots == 0) give_back(consumed);   // its group was gathered
+                                    if ((!group_gather || gg_nslots == 0) && px_nslots == 0) give_back(consumed);   // its group was gathered
                                 } else {
                                     const bool r0 = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                                     const uint8_t* bp = r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
@@ -5384,7 +5401,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             release_to(m.g->n_expert);
                         }
                         gx_flush();   // STRATA_PF_GU_EXACT: the layer's last group
-                        px_flush();   // STRATA_PF_EXL3_FUSED: the layer's last group
+                        px_flush();   // STRATA_PF_EXL3_FUSED: the layer's last group (and the slots it held back)
+                        if (px_direct) give_back(consumed);
                     }
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail, row_sd 1 (s_down is in them)
