@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
     std::printf("%s: %d of %d checks bit-exact\n", fails ? "FAILED" : "OK", checks - fails, checks);
     if (bench) {
         const LayerFmt& f = lay.at(bench_layer);
-        const int NG = 32, NE = 40, CAPB = 80;
+        const int NG = 32, NE = 40, CAPB = 40;   // a 4-token window: cap = 4 x top-10
         void* dblobs = nullptr;
         cudaMalloc(&dblobs, (size_t) NG * f.blob);
         for (int g = 0; g < NG; ++g) load(bench_layer, 13 * g + 1, (uint8_t*) dblobs + (size_t) g * f.blob);
