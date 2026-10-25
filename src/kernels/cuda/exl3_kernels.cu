@@ -206,7 +206,7 @@ __global__ void __launch_bounds__(128) prep_kernel(const unsigned long long* grp
                                                    int gk2, int dk2, int role0) {
     const int e = blockIdx.x, role = role0 + (int) blockIdx.y, j = blockIdx.z, i = threadIdx.x;
     const int ng = (int) min<int64_t>(*n_groups, cap_groups);
-    if (e >= grp_start[ng]) return;
+    if (e < grp_start[0] || e >= grp_start[ng]) return;   // a PCIe pass's entries follow the VRAM pass's
     const EntLay L(H, F);
     uint8_t* es = scratch + (size_t) e * L.bytes;
     const RoleView m = role_view(reinterpret_cast<const uint8_t*>(grp_ptr[ent_grp[e]]), role, H, F, gk2, dk2);
@@ -244,7 +244,7 @@ __global__ void qs_kernel(const int32_t* grp_start, const int32_t* n_groups, int
                           int F, int role0) {
     const int e = blockIdx.x, role = role0 + (int) blockIdx.y;
     const int ng = (int) min<int64_t>(*n_groups, cap_groups);
-    if (e >= grp_start[ng] || threadIdx.x != 0) return;
+    if (e < grp_start[0] || e >= grp_start[ng] || threadIdx.x != 0) return;
     const EntLay L(H, F);
     uint8_t* es = scratch + (size_t) e * L.bytes;
     const float* d = reinterpret_cast<const float*>(es + (role == 0 ? L.dg : role == 1 ? L.du : L.dd));
@@ -280,7 +280,7 @@ __global__ void __launch_bounds__(128) gu_kernel(const unsigned long long* grp_p
                                                  uint8_t* scratch, int H, int F, int gk2, int dk2) {
     const int e = blockIdx.x, b = blockIdx.y;
     const int ng = (int) min<int64_t>(*n_groups, cap_groups);
-    if (e >= grp_start[ng]) return;
+    if (e < grp_start[0] || e >= grp_start[ng]) return;   // a PCIe pass's entries follow the VRAM pass's
     const EntLay L(H, F);
     uint8_t* es = scratch + (size_t) e * L.bytes;
     const uint8_t* blob = reinterpret_cast<const uint8_t*>(grp_ptr[ent_grp[e]]);
@@ -301,7 +301,7 @@ __global__ void __launch_bounds__(128) down_kernel(const unsigned long long* grp
                                                    int gk2, int dk2) {
     const int e = blockIdx.x, b = blockIdx.y;
     const int ng = (int) min<int64_t>(*n_groups, cap_groups);
-    if (e >= grp_start[ng]) return;
+    if (e < grp_start[0] || e >= grp_start[ng]) return;   // a PCIe pass's entries follow the VRAM pass's
     const EntLay L(H, F);
     uint8_t* es = scratch + (size_t) e * L.bytes;
     const uint8_t* blob = reinterpret_cast<const uint8_t*>(grp_ptr[ent_grp[e]]);

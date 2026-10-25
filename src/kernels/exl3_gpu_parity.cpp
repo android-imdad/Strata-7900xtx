@@ -71,18 +71,21 @@ int main(int argc, char** argv) {
         cudaMemcpy(dst, b.data(), f.blob, cudaMemcpyHostToDevice);
     };
     // groups: list of (blob slot, record indices as entries); token t = entry index, dst row = entry index
+    int offset = 0;
     auto run = [&](const LayerFmt& f, const std::vector<std::vector<int>>& groups, std::vector<std::vector<float>>& ys) {
-        std::vector<int32_t> start{0}, ent;
+        const int base = offset;   // entries [base, base + n): a PCIe pass's follow the VRAM pass's
+        std::vector<int32_t> start{base}, ent;
         std::vector<float> xs;
         for (const auto& g : groups) {
             for (int r : g) { ent.push_back((int32_t) ent.size()); xs.insert(xs.end(), recs[(size_t) r].x.begin(), recs[(size_t) r].x.end()); }
-            start.push_back((int32_t) ent.size());
+            start.push_back((int32_t) (base + ent.size()));
         }
         const int ng = (int) groups.size(), ne = (int) ent.size();
         std::vector<int32_t> i32(64, 0);
         i32[0] = ng;
         for (int i = 0; i <= ng; ++i) i32[1 + i] = start[(size_t) i];
-        for (int e = 0; e < ne; ++e) { i32[8 + e] = e; i32[32 + e] = e; }   // dst, tok
+        for (int e = 0; e < base; ++e) { i32[8 + e] = 0; i32[32 + e] = 0; }   // another pass's entries: not this launch's
+        for (int e = 0; e < ne; ++e) { i32[8 + base + e] = e; i32[32 + base + e] = e; }   // dst, tok
         cudaMemcpy(d_i32, i32.data(), 4 * 64, cudaMemcpyHostToDevice);
         unsigned long long p[2] = {(unsigned long long) d_blob[0], (unsigned long long) d_blob[1]};
         cudaMemcpy(d_ptr, p, 16, cudaMemcpyHostToDevice);
@@ -119,6 +122,10 @@ int main(int argc, char** argv) {
         for (int i = 0; (int) grp.size() < 8 && i < nrec; ++i) if (recs[(size_t) i].layer != key.first || recs[(size_t) i].expert != key.second) grp.push_back(i);
         run(f, {grp}, ys);
         for (size_t i = 0; i < idx.size(); ++i) cmp(ys[i], idx[i], "group of 8");
+        offset = 3;   // the same group as a launch whose entries start at 3 (a PCIe pass after a VRAM one)
+        run(f, {grp}, ys);
+        offset = 0;
+        for (size_t i = 0; i < idx.size(); ++i) cmp(ys[i], idx[i], "group of 8 at entry 3");
         // two groups in one launch: the previous expert of the same layer in slot 1
         if (prev.first == key.first) {
             load(prev.first, prev.second, d_blob[1]);
