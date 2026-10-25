@@ -1,14 +1,14 @@
 <h1 align="center">Strata for the RX 7900 XTX</h1>
 
-<p align="center"><b>A faster <a href="https://github.com/Niko1221/Strata">Strata</a> for the AMD Radeon RX 7900 XTX, with output
-bit-identical to the original</b><br>
+<p align="center"><b>A faster <a href="https://github.com/Niko1221/Strata">Strata</a> for the AMD Radeon RX 7900 XTX: output
+bit-identical to the original by default, and smaller, faster EXL3 experts as an option</b><br>
 RX 7900 XTX (gfx1100) · Linux · ROCm · free and open source</p>
 
 [Strata](https://github.com/Niko1221/Strata) runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**,
 a 125-billion-parameter model, on one gaming PC. This fork tunes it for the RX 7900 XTX. Every speedup keeps the output
 **bit-identical** to upstream (the same log-probabilities and the same token at every position, so the same perplexity): faster, with nothing traded
 for quality. The exceptions are opt-in: a parity build, described under [Install](#install), and the
-[EXL3 experts](#exl3-experts-smaller-faster-same-quality), a smaller quantization of the model's experts.
+[EXL3 experts](#exl3-experts-smaller-faster-similar-quality), a smaller quantization of the model's experts.
 
 Upstream Strata v0.2.4.1 against this fork (merged with v0.2.4.1), same PC, same day, alternating rounds, medians of 3
 (RX 7900 XTX 24 GB, Ryzen 7 9800X3D, 62 GiB RAM, Linux, ROCm 10.2, IQ3_S):
@@ -40,22 +40,24 @@ engine above, same day, 3 alternating rounds, medians: reads 4K prompts **+3.2%*
 
 **Newest, opt-in: EXL3 experts.** The same model with its routed experts in turboderp's
 [EXL3](https://github.com/turboderp-org/exllamav3) 2.68-bit format instead of IQ3_S: the experts are **22% smaller**
-(39.5 GB instead of 50.3 GB), the quality is the same on chat and better on long code and documents (perplexity
-below), and it is faster everywhere. Same engine (`7c5de68d`) and settings, 3 alternating rounds, medians; every EXL3
-round beat every IQ3_S round in every row:
+(39.5 GB instead of 50.3 GB), the quality is within 0.2% on chat and 5% better on long code and documents
+(perplexity below). Upstream Strata v0.2.4.1 (IQ3_S, its defaults) against this fork with the EXL3 experts, same PC, same day,
+3 alternating rounds, medians; every round of the fork beat every round of upstream in every row:
 
-| | IQ3_S experts | EXL3 2.68 experts | |
+| | Upstream v0.2.4.1 (IQ3_S) | This fork, EXL3 2.68 experts | |
 | --- | ---: | ---: | ---: |
-| Writes answers (short chat) | 103.7 tokens/s | 115.8 tokens/s | **+12%** |
-| First token (short chat) | 0.85 s | 0.40 s | **-53%** |
-| Reads a 4K prompt | 1,450 tokens/s | 1,880 tokens/s | **+30%** |
-| Reads a 16K prompt | 1,937 tokens/s | 2,251 tokens/s | **+16%** |
-| Reads a 32K prompt | 2,011 tokens/s | 2,279 tokens/s | **+13%** |
-| Agent turn, first token | 2.80 s | 1.66 s | **-41%** |
-| Agent session, writes answers | 104.1 tokens/s | 113.5 tokens/s | **+9%** |
+| Writes answers (short chat) | 87.3 tokens/s | 115.1 tokens/s | **+32%** |
+| First token (short chat) | 1.16 s | 0.40 s | **-66%** |
+| Reads a 4K prompt | 1,066 tokens/s | 1,882 tokens/s | **+76%** |
+| Reads a 16K prompt | 1,378 tokens/s | 2,247 tokens/s | **+63%** |
+| Reads a 32K prompt | 1,398 tokens/s | 2,278 tokens/s | **+63%** |
+| Agent turn, first token | 3.83 s | 1.69 s | **-56%** |
+| Agent session, writes answers | 97.2 tokens/s | 110.9 tokens/s | **+14%** |
 
-Report: [bench/results/2026-10-25-...-exl3](bench/results/2026-10-25-community-rx-7900-xtx-gfx1100-exl3/). Sizes,
-perplexity and how to set it up: [EXL3 experts](#exl3-experts-smaller-faster-same-quality).
+Against this fork's own IQ3_S experts (the same engine `7c5de68d` and settings), EXL3 writes answers 9-12% faster and
+reads prompts 13-30% faster. Report:
+[bench/results/2026-10-25-...-exl3](bench/results/2026-10-25-community-rx-7900-xtx-gfx1100-exl3/). Sizes,
+perplexity and how to set it up: [EXL3 experts](#exl3-experts-smaller-faster-similar-quality).
 
 Decode is also deterministic: the same question gives the same answer whatever the drafter does (and, with an opt-in
 build, whatever the expert placement).
@@ -164,7 +166,7 @@ strata generate: STRATA_CPU_PARITY: on (the CPU expert rows in the GPU's arithme
 If a check fails at start-up (another ROCm, another GPU), the feature turns itself off and the log says why. Every
 switch, how each one was checked and its limits: **[docs/RX7900XTX.md](docs/RX7900XTX.md)**.
 
-## EXL3 experts: smaller, faster, same quality
+## EXL3 experts: smaller, faster, similar quality
 
 An opt-in pack that swaps the model's **routed experts** (the 48 layers x 512 experts that hold most of its weights)
 from the GSQ-RCO IQ3_S GGUF for turboderp's [EXL3](https://github.com/turboderp-org/exllamav3) quant of the same model
@@ -191,29 +193,27 @@ adds 39.5 GB of disk.
 | | Chat (turboderp's trace, 45,588 tokens) | Code and docs after long prompts (2,557 tokens) |
 | --- | ---: | ---: |
 | The uncompressed model (BF16, turboderp's chart) | 1.3847 | - |
-| Strata, IQ3_S experts | 1.4191 | 4.4465 |
-| Strata, **EXL3 2.68 experts** | 1.4218: **+0.19%** (95% CI -0.01% .. +0.39%) | 4.2122: **-5.3%** (95% CI -2.8% .. -7.7%) |
+| Upstream v0.2.4.1, IQ3_S experts (the reference) | 1.4187 | 4.4438 |
+| This fork, **EXL3 2.68 experts** | 1.4218: 0.22% worse (95% CI 0.02% .. 0.42%) | 4.2122: **5.2% better** (95% CI 2.6% .. 7.8%) |
 | exllamav3 2.68, its own engine (for reference) | 1.4166 | 4.2176 |
 | exllamav3 3.18, its own engine (for reference) | 1.4026 | 4.2213 |
 
-On chat the two packs tie (the confidence interval includes zero); on long code and documentation EXL3 is clearly
-better, at 22% less memory. The percentages and their 95% confidence intervals compare the two packs token by token
-on the same text. The exllamav3 rows use exllamav3's own weights for the rest of the model too (attention at 6-7
-bits, an 8-bit n-gram table), so they are a reference point, not a like-for-like comparison.
+On chat EXL3 is 0.22% worse than upstream's IQ3_S, a small difference just outside the noise; on long code and
+documentation it is 5.2% better, at 22% less memory. The percentages and their 95% confidence intervals compare EXL3 with upstream's IQ3_S token by token
+on the same text (this fork's own IQ3_S scores the same as upstream's within noise: 4.4465 and 1.4191). The
+exllamav3 rows use exllamav3's own weights for the rest of the model too (attention at 6-7 bits, an 8-bit n-gram
+table), so they are a reference point, not a like-for-like comparison.
 
-> **What perplexity means.** At every token of a real text, the model gives a probability to the token that actually
-> comes next. Perplexity is the exponential of the average of -log(that probability): roughly, how many equally
-> likely tokens the model is choosing between at each step. 1.0 would be a model that is always certain and always
-> right; 1.42 means it is usually close to sure and sometimes hesitates. Compression adds a little uncertainty, so
-> perplexity measures how much a quantized model loses against the original: on the chat trace the uncompressed model
-> scores 1.3847, IQ3_S is 2.5% above it and EXL3 2.68 2.7%. The two columns are different texts (chat is much easier to
-> predict than raw code and documentation), so compare rows within a column, not across columns. On the large chat
-> set, differences of a few tenths of a percent are noise; on the smaller code set, 1-2%. The confidence intervals say
-> which differences are real.
+> **What perplexity means:** how well the model predicts real text - roughly, how many equally likely tokens it is
+> choosing between at each step. Lower is better and 1.0 would be perfect. Compressing the model raises it a little, so
+> the smaller the gap to the uncompressed model, the less quality was lost. Compare rows within a column (the two
+> texts differ in difficulty), and treat differences inside the confidence interval as noise. More:
+> **[docs/PERPLEXITY.md](docs/PERPLEXITY.md)**.
 
-**Speed:** the table at the top (same engine and settings, every round faster). Writing answers is +9-12%, reading
-prompts +13-30%, and first tokens arrive 40-50% sooner, mostly because the prompt path decodes the EXL3 experts inside
-its matrix kernels instead of first expanding each expert to 16-bit weights.
+**Speed:** the table at the top. Against upstream, writing answers is +14-32%, reading prompts +63-76%, and first
+tokens arrive 56-66% sooner; against this fork's own IQ3_S, +9-12%, +13-30% and 41-53% sooner. Most of the prompt
+gain comes from decoding the EXL3 experts inside the matrix kernels instead of first expanding each expert to 16-bit
+weights.
 
 **Set it up**
 
@@ -305,14 +305,18 @@ so upstream or anyone else is welcome to take any part of it.
 To **[Niko](https://github.com/Niko1221)** and **[Strata](https://github.com/Niko1221/Strata)**. Strata is what makes a
 125-billion-parameter model usable on one gaming PC at all, and everything in this fork builds on it: the engine, the
 expert packs, the multi-token drafting and the official benchmark used for every number here. Deterministic
-decode is upstream's own `STRATA_IQ_MT_MIN` switch. Thanks also to Strata's contributors, and to AMD's ROCm, rocBLAS
-and Tensile, which generated the prompt kernel.
+decode is upstream's own `STRATA_IQ_MT_MIN` switch. Thanks also to Strata's contributors, to AMD's ROCm, rocBLAS
+and Tensile, which generated the prompt kernel, and to **[turboderp](https://github.com/turboderp)** for
+[exllamav3](https://github.com/turboderp-org/exllamav3), its EXL3 format and the EXL3 quant of this model that the
+EXL3 experts use (and the chat trace and BF16 numbers they are measured against).
 
 ## Credits and license
 
 Strata is by [Niko](https://github.com/Niko1221) and its contributors. The model is
 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team, compressed by
-[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5) and Unsloth.
+[ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5) and Unsloth; the
+EXL3 experts are [turboderp's EXL3 quant](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3) in
+[exllamav3](https://github.com/turboderp-org/exllamav3)'s format (MIT).
 Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
 [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Open source under the [MIT License](LICENSE); a few parts and
 every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).

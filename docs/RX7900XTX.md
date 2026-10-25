@@ -5,7 +5,7 @@ the model's output **bit-identical**: reading the same texts, the engine with th
 and the same top token at every position as the engine without them, so the same perplexity. Nothing here trades quality for speed. The exceptions are opt-in:
 part 4 (`-DSTRATA_SWIGLU_SEXP` + `STRATA_CPU_PARITY=1`) shifts the output once against today's engine so that from then
 on it no longer depends on where the experts sit, and part 8's EXL3 pack is another quantization of the experts
-(22% smaller, the same perplexity on chat, 5% lower on long code and docs, faster).
+(22% smaller, perplexity within 0.2% on chat and 5% lower on long code and docs, faster).
 
 Measured on: RX 7900 XTX 24 GB (gfx1100), Ryzen 7 9800X3D, 62 GiB RAM, Linux 7.2, ROCm 10.2 (TheRock nightly
 10.2.0a20260930), Qwen3.8-Flash-Next GSQ-RCO IQ3_S, 262,144-token context, no control vector.
@@ -382,8 +382,13 @@ computation, for IQ3_S too. Part 5's `STRATA_PF_PIECE=8192` is exact only when t
 | exllamav3 2.68 (its own engine and weights) | 1.4166 (-0.18%) | 4.2176 |
 | exllamav3 3.18 (its own engine and weights) | 1.4026 (-1.17%) | 4.2213 |
 
+Against upstream v0.2.4.1's own IQ3_S (1.4187 and 4.4438; this fork's IQ3_S equals it within noise): EXL3 is +0.22%
+on chat (95% CI +0.02 .. +0.42%: a real but very small difference) and -5.2% on code and docs (CI -2.6 .. -7.8%).
+What the numbers mean: [docs/PERPLEXITY.md](PERPLEXITY.md).
+
 The chat trace is turboderp's in-domain set; the second set is kl.py's texts (code and documentation read after 16K,
-16K and 64K prompts, text tokens only). On chat the two packs tie; on long code and docs EXL3 is clearly better. The
+16K and 64K prompts, text tokens only). On chat the two packs are within 0.2%; on long code and docs EXL3 is clearly
+better. The
 0.37% that exllamav3's 2.68 keeps over Strata's on the chat trace is not the activations (Q15 activations changed
 nothing) - most likely its non-expert weights (6-7 bits) against the GGUF's.
 
