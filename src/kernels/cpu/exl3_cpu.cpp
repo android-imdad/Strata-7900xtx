@@ -3,8 +3,10 @@
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/sexp.hpp"
 
 namespace strata::kernels::cpu::exl3c {
@@ -83,6 +85,19 @@ void decode_tile(const uint32_t* w, int K2, int16_t s[16][16]) {
 
 }  // namespace
 
+void prep_avx512(const Mat& m, const float* x, Act& a);
+void block_avx512(const Mat& m, const Act* const* a, int nt, int b, float* const* y);
+
+namespace {
+int g_isa = -1;
+}
+
+int isa() {
+    if (g_isa < 0) g_isa = cpu_avx512_ok() && std::getenv("STRATA_EXL3_SCALAR") == nullptr ? 2 : 0;
+    return g_isa;
+}
+void set_isa(int i) { g_isa = i; }
+
 Mat role(const uint8_t* blob, int r, int n_embd, int n_ff, int gu_k2, int d_k2) {
     size_t at = 0;
     Mat m;
@@ -100,6 +115,7 @@ Mat role(const uint8_t* blob, int r, int n_embd, int n_ff, int gu_k2, int d_k2) 
 }
 
 void prep(const Mat& m, const float* x, Act& a) {
+    if (isa() == 2) { prep_avx512(m, x, a); return; }
     float qs = 0.f;
     for (int j = 0; j < m.k / 128; ++j) {
         float v[128];
@@ -113,6 +129,7 @@ void prep(const Mat& m, const float* x, Act& a) {
             float q = d > 0.f ? round_away(v[i] / d) : 0.f;
             q = std::fmin(std::fmax(q, -127.f), 127.f);
             a.q[128 * j + i] = (int8_t) q;
+            a.q4[128 * j + i] = (int32_t) (((uint32_t) (uint8_t) (int8_t) q) * 0x01010101u);
             Q += (int) q;
         }
         a.d[j] = d;
@@ -122,6 +139,7 @@ void prep(const Mat& m, const float* x, Act& a) {
 }
 
 void block(const Mat& m, const Act* const* a, int nt, int b, float* const* y) {
+    if (isa() == 2) { block_avx512(m, a, nt, b, y); return; }
     const int tn_per = m.n / 16, tile_bytes = 16 * m.K2;
     float acc[8][128];
     for (int t = 0; t < nt; ++t)

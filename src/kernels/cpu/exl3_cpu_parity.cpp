@@ -144,6 +144,11 @@ int main(int argc, char** argv) {
     int fails = 0, checks = 0;
     std::map<std::pair<int, int>, std::vector<int>> by_expert;
     for (int i = 0; i < nrec; ++i) by_expert[{recs[(size_t) i].layer, recs[(size_t) i].expert}].push_back(i);
+    const int best = x::isa();
+    for (int isa : {0, 2}) {
+    if (isa > best) continue;
+    x::set_isa(isa);
+    std::printf("-- %s path\n", isa == 2 ? "AVX-512" : "scalar");
     for (const auto& [key, idx] : by_expert) {
         const LayerFmt& f = lay.at(key.first);
         const auto blob = load_blob(key.first, key.second);
@@ -180,6 +185,8 @@ int main(int argc, char** argv) {
         std::printf("layer %2d expert %3d (K %.1f/%.1f): %zu records checked in groups of 1..8\n", key.first,
                     key.second, f.gk2 / 2.0, f.dk2 / 2.0, idx.size());
     }
+    }
+    x::set_isa(best);
     std::printf("%s: %d of %d checks bit-exact\n", fails ? "FAILED" : "OK", checks - fails, checks);
 
     if (bench) {

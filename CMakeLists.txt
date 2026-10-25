@@ -1709,10 +1709,13 @@ if(STRATA_NATIVE_EXPERTS)
                                            src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
                                            src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
                                            src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp
-                                           src/kernels/cpu/replica_avx512.cpp src/kernels/cpu/exl3_cpu.cpp)
+                                           src/kernels/cpu/replica_avx512.cpp src/kernels/cpu/exl3_cpu.cpp
+                                           src/kernels/cpu/exl3_avx512.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   # EXL3 experts (exl3_expert.hpp's parity arithmetic): every product and sum rounded on its own, like the GPU's
   set_source_files_properties(src/kernels/cpu/exl3_cpu.cpp PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/fp:precise,-ffp-contract=off>")
+  set_source_files_properties(src/kernels/cpu/exl3_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                              "$<IF:$<CXX_COMPILER_ID:MSVC>,/arch:AVX512;/fp:precise,-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-ffp-contract=off>")
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp
                                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")

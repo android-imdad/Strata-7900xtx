@@ -20,6 +20,7 @@ inline constexpr int kMaxK = 2560;
 /// One token's prepared input to one matrix: int8 values, the per-128-block scale and the scale-weighted sum.
 struct Act {
     alignas(64) int8_t q[kMaxK];
+    alignas(64) int32_t q4[kMaxK];   ///< each q repeated in all four bytes (the AVX-512 VNNI dot's signed operand)
     float d[kMaxK / 128];
     float qs = 0.f;          ///< sum over blocks j of d_j * (sum of block j's q), left to right
 };
@@ -40,6 +41,11 @@ void prep(const Mat& m, const float* x, Act& a);
 
 /// Steps 3-5 for the 128 outputs of block b (outputs [128 b, 128 b + 128)) of nt tokens: y[t][0..128).
 void block(const Mat& m, const Act* const* a, int nt, int b, float* const* y);
+
+/// The path prep / block take: 2 AVX-512 (F, BW, VL, VNNI, VBMI), 0 scalar (STRATA_EXL3_SCALAR=1 forces it) - the
+/// same bits either way.
+int isa();
+void set_isa(int isa);   // tests
 
 /// gate and up block b, then h = silu(g) * up (silu(g) = g / (1 + sexp(-g))): h[t][0..128).
 void gu_block(const Mat& g, const Mat& u, const Act* const* ag, const Act* const* au, int nt, int b, float* const* h);
