@@ -496,13 +496,13 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     {
         std::ifstream probe(pack_dir + "/hadamard.txt");
         const bool have = (bool) probe;
-        if (L.version >= 5 && !have) {
+        if (L.version == 5 && !have) {   // v6 (EXL3) carries its rotations in the blobs: no hadamard.txt
             err = "native_experts.txt v5 declares Hadamard-folded experts, but " + pack_dir + "/hadamard.txt is missing";
             return false;
         }
-        if (have && L.version < 5) {
+        if (have && L.version != 5) {
             err = pack_dir + "/hadamard.txt exists but native_experts.txt is v" + std::to_string(L.version) +
-                  ": the pack is inconsistent (repack with tools/iq_pack.py)";
+                  ": the pack is inconsistent (repack with tools/iq_pack.py; an EXL3 pack has no hadamard.txt)";
             return false;
         }
         for (int64_t l = 0; l < n_layers; ++l) L.fmt[(size_t) l].layer = (int) l;

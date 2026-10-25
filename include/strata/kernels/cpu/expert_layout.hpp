@@ -98,6 +98,6 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
 /// written only when some layer's roles are in different shards (every other pack stays v3, byte for byte).
 /// v5 = v4 plus `hadamard.txt` beside it: Hadamard-folded experts (hadamard.hpp), written only for such models,
 /// so an engine that cannot rotate the activations refuses the pack instead of running it wrong.
-inline constexpr int kExpertLayoutVersion = 5;
+inline constexpr int kExpertLayoutVersion = 6;   // v6: EXL3 experts (tools/exl3_pack.py), rotations inside the blobs
 
 }  // namespace strata::kernels::cpu
