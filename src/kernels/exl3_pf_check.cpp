@@ -111,22 +111,26 @@ int main(int argc, char** argv) {
         fx.read(reinterpret_cast<char*>(xs[(size_t) r].data()), 4 * H);
         fx.seekg(4 * (F + H), std::ios::cur);
     }
-    const int NE = 16;
-    int cnts[NE] = {1, 2, 5, 16, 17, 31, 64, 65, 100, 127, 128, 129, 200, 250, 3, 300};
+    const char* nev = std::getenv("STRATA_PFC_NE");   // (bench) experts a group, up to kExl3PfMax
+    const int NE = nev ? std::max(1, std::min(std::atoi(nev), strata::kernels::kExl3PfMax)) : 16;
+    const int base_cnts[16] = {1, 2, 5, 16, 17, 31, 64, 65, 100, 127, 128, 129, 200, 250, 3, 300};
+    std::vector<int> cnts((size_t) NE);
+    for (int e = 0; e < NE; ++e) cnts[(size_t) e] = base_cnts[e % 16];
     if (const char* v = std::getenv("STRATA_PFC_AVG")) {   // (bench) row counts spread around an average: 0.25..1.75 x
         const int avg = std::atoi(v);
-        for (int e = 0; e < NE; ++e) cnts[e] = std::max(1, avg / 4 + (int) ((3.0 * avg / 2.0) * ((e * 7 + 3) % NE) / (NE - 1)));
+        for (int e = 0; e < NE; ++e)
+            cnts[(size_t) e] = std::max(1, avg / 4 + (int) ((3.0 * avg / 2.0) * ((e * 7 + 3) % NE) / std::max(1, NE - 1)));
     }
     strata::kernels::Exl3PfGroup g{};
     g.n = NE;
     int rows = 0;
-    for (int e = 0; e < NE; ++e) { g.off[e] = rows + 7 * e; g.cnt[e] = cnts[e]; rows += cnts[e]; }
-    const int total_rows = g.off[NE - 1] + cnts[NE - 1];
+    for (int e = 0; e < NE; ++e) { g.off[e] = rows + 7 * e; g.cnt[e] = cnts[(size_t) e]; rows += cnts[(size_t) e]; }
+    const int total_rows = g.off[NE - 1] + cnts[(size_t) NE - 1];
     std::ifstream bin(pack + "/experts.bin", std::ios::binary);
     std::vector<void*> dblob((size_t) NE);
     for (int e = 0; e < NE; ++e) {
         std::vector<uint8_t> b(f.blob);
-        bin.seekg((std::streamoff) (f.off + (unsigned long long) (13 * e + 1) * f.blob));
+        bin.seekg((std::streamoff) (f.off + (unsigned long long) ((13 * e + 1) % 512) * f.blob));
         bin.read(reinterpret_cast<char*>(b.data()), (std::streamsize) f.blob);
         cudaMalloc(&dblob[(size_t) e], f.blob);
         cudaMemcpy(dblob[(size_t) e], b.data(), f.blob, cudaMemcpyHostToDevice);

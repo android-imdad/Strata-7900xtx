@@ -1341,16 +1341,18 @@ __device__ __forceinline__ f8 wmma(h16 a, h16 b, f8 c) {
 #endif
 }
 
-__device__ __forceinline__ int expert_of_rel(const Exl3PfGroup& g, int r) {
-    int e = 0;
-    while (e + 1 < g.n && g.rel[e + 1] <= r) ++e;
-    return e;
+// the expert whose range [p[e], p[e + 1]) holds v (p ascending, p[0] <= v < p[n]): a binary search
+__device__ __forceinline__ int expert_in(const int32_t* p, int n, int v) {
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (p[mid] <= v) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
 }
-__device__ __forceinline__ int expert_of_mc(const Exl3PfGroup& g, int c, const int32_t* mc) {
-    int e = 0;
-    while (e + 1 < g.n && mc[e + 1] <= c) ++e;
-    return e;
-}
+__device__ __forceinline__ int expert_of_rel(const Exl3PfGroup& g, int r) { return expert_in(g.rel, g.n, r); }
+__device__ __forceinline__ int expert_of_mc(const Exl3PfGroup& g, int c, const int32_t* mc) { return expert_in(mc, g.n, c); }
 
 __device__ __forceinline__ __half hsat(float v) { return __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f)); }
 
@@ -2038,7 +2040,7 @@ bool exl3_pf_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
 void exl3_pf_group(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const Exl3PfGroup& in, const uint16_t* Xs,
                    float* GU, uint16_t* Hh, float* Dm, float* rs, void* stream) {
     const int gk2 = ex::k2_of(gu_type), dk2 = ex::k2_of(d_type);
-    if (!exl3_pf_supported(gu_type, d_type, n_embd, n_ff) || in.n <= 0 || in.n > 16) {
+    if (!exl3_pf_supported(gu_type, d_type, n_embd, n_ff) || in.n <= 0 || in.n > kExl3PfMax) {
         std::fprintf(stderr, "exl3_pf_group: types %d/%d, %lld x %lld, %d experts\n", gu_type, d_type, (long long) n_embd,
                      (long long) n_ff, in.n);
         std::exit(1);

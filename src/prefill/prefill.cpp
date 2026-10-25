@@ -4929,12 +4929,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                            strata::kernels::exl3_pf_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type,
                                                                               lay.fmt[(size_t) l].n_embd, lay.fmt[(size_t) l].n_ff) &&
                                            m.pf_rs != nullptr && N == 2560;
-                        const int px_max = std::min(16, DQ + dq_sets() * gu_exact_group());
                         // the streamed walk (a ring far larger than a group): a streamed blob is read in its ring slot,
-                        // the group's slots released by one event at the flush and handed back to the issuer only then
-                        // (else a copy into dq_gu[i] frees the slot at once)
-                        const bool px_direct = stream_all && m.ring >= 8 * px_max;
-                        int px_slots[16];
+                        // the group's slots released by one event at the flush and handed back to the issuer only then,
+                        // so a group can take kExl3PfMax experts (fewer, larger launches); else a copy into dq_gu[i]
+                        // frees the slot at once and the group has as many experts as there are dq buffers (<= 16)
+                        const bool px_direct = stream_all && m.ring >= 8 * strata::kernels::kExl3PfMax;
+                        static const int px_env = [] { const char* v = std::getenv("STRATA_PF_EXL3_GROUP"); return v ? std::atoi(v) : 0; }();   // (tuning)
+                        const int px_max = px_direct ? (px_env > 0 ? std::min(px_env, strata::kernels::kExl3PfMax) : strata::kernels::kExl3PfMax)
+                                                     : std::min(16, DQ + dq_sets() * gu_exact_group());
+                        int px_slots[strata::kernels::kExl3PfMax];
                         int px_nslots = 0;
                         auto px_flush = [&]() {
                             if (px.n == 0) return;
