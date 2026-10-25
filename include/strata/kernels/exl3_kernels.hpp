@@ -59,3 +59,26 @@ void exl3_rotate_gu_out(float* gu, int64_t rows, int64_t n_ff, const uint16_t* s
 void exl3_rotate_d_out(float* dm, int64_t rows, int64_t n_embd, const uint16_t* svh_d, void* stream);
 
 }  // namespace strata::kernels
+
+namespace strata::kernels {
+
+/// The prompt path's EXL3 experts, a group at a time: up to 16 experts of one layer, each over its rows of the chunk
+/// (Xs FP16 [rows][n_embd] in, Dm F32 [rows][n_embd] out - before that its rows hold the rotated inputs; GU F32
+/// [rows][2 n_ff], Hh FP16 [rows][n_ff] and rs F32 [rows][3] are scratch rows of the same chunk).  The trellis is decoded inside FP16 WMMA tiles (no dequantized weights): the
+/// activations are rotated per expert (x' = H(x * suh)), the weights enter as 1024 + s.  The caller fills blob, off,
+/// cnt and n; rel and mc0 are computed here.
+struct Exl3PfGroup {
+    const uint8_t* blob[16];
+    int32_t off[16];   // expert e's first row in the chunk
+    int32_t cnt[16];   // its rows
+    int32_t rel[17];   // the group's rows: expert e's at [rel[e], rel[e + 1]) of the scratch
+    int32_t mc0[17];   // 64-row chunks: expert e's at [mc0[e], mc0[e + 1])
+    int32_t n;
+};
+/// Whether exl3_pf_group takes this layer (the shapes and K it is built for).
+bool exl3_pf_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+void exl3_pf_group(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const Exl3PfGroup& g, const uint16_t* Xs,
+                   float* GU, uint16_t* Hh, float* Dm, float* rs, void* stream);
+
+}  // namespace strata::kernels
+

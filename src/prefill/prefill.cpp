@@ -371,6 +371,13 @@ inline int dq_sets() {
     }();
     return n;
 }
+// STRATA_PF_EXL3_FUSED (default on; 0 = off): an EXL3 layer's experts 16 at a time through exl3_pf_group - the trellis
+// decoded inside FP16 WMMA tiles, the activations rotated per expert - in place of the dequantized FP16 weights and
+// one GEMM per expert.  The prompt path's rounding changes (FP16 x' . (1024 + s) instead of x . W_in in FP16).
+inline bool pf_exl3_fused() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_EXL3_FUSED"); return !(v && v[0] == '0'); }();
+    return on;
+}
 constexpr int DQ_MAX = DQ + 2 * strata::prefill::kGuExactMax;   // two GU_EXACT buffer sets (dq_sets)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
@@ -1019,6 +1026,7 @@ struct Prefill::Impl {
     uint16_t* dq_d[DQ_MAX] = {};
     bool gu_exact_ok = false;   // STRATA_PF_GU_EXACT passed its start-up check against Gemm::f16
     float* gu_exact_ws = nullptr;   // ... its 3-split partials (experts below 65 tokens)
+    float* pf_rs = nullptr;         // STRATA_PF_EXL3_FUSED: per row, sum(x') of gate and up, sum(h')
     float* snap_hist[2] = {};       // STRATA_PF_PIECE snapshots: a GDN layer's conv history (start, at the point)
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
@@ -1829,6 +1837,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     // + the EXL3 svh tails (exl3_dequant_left_f16): 2 x 640 after the gate/up weights, 2560 after the down weights
     for (int i = 0; i < DQ + dq_sets() * gu_exact_group(); ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560 + 1280, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640 + 2560, ok); }
     m.gu_exact_ws = gu_exact_group() > 0 ? o.take<float>((size_t) 3 * gu_exact_group() * 64 * 1280, ok) : nullptr;
+    m.pf_rs = o.take<float>(T * K * 3, ok);
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         m.ids_identity = o.take<int32_t>(T * K, ok);
@@ -2564,6 +2573,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
     for (int i = 0; i < DQ + dq_sets() * gu_exact_group(); ++i) { o.take<uint16_t>(1280 * 2560 + 1280, ok); o.take<uint16_t>(2560 * 640 + 2560, ok); }
     if (gu_exact_group() > 0) o.take<float>((size_t) 3 * gu_exact_group() * 64 * 1280, ok);
+    o.take<float>(T * K * 3, ok);   // pf_rs
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
         o.take<int32_t>(T * K, ok);
@@ -4912,6 +4922,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             gg_nslots = 0;
                             gg.first = gg.n;
                         };
+                        // STRATA_PF_EXL3_FUSED: the open group (a streamed expert's blob copied into dq_gu[i], its slot
+                        // given back at once; a resident one read in its cache slot)
+                        strata::kernels::Exl3PfGroup px{};
+                        const bool px_on = pf_exl3_fused() && lay.native && !lay.fmt.empty() && lay.fmt[(size_t) l].exl3_gu &&
+                                           strata::kernels::exl3_pf_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type,
+                                                                              lay.fmt[(size_t) l].n_embd, lay.fmt[(size_t) l].n_ff) &&
+                                           m.pf_rs != nullptr && N == 2560;
+                        const int px_max = std::min(16, DQ + dq_sets() * gu_exact_group());
+                        auto px_flush = [&]() {
+                            if (px.n == 0) return;
+                            pt.mark(kPfGemmGU, cs);
+                            const auto& f = lay.fmt[(size_t) l];
+                            strata::kernels::exl3_pf_group(f.gu_type, f.d_type, f.n_embd, f.n_ff, px, m.Xs, m.GU, m.Hh, m.Dm,
+                                                           m.pf_rs, m.cs);
+                            px = strata::kernels::Exl3PfGroup{};
+                        };
                         // STRATA_PF_GU_EXACT: the deferred experts (their dequantized buffers DQ.. stay theirs until the flush)
                         GuExactGroup gx;
                         int64_t gx_o0[kGuExactMax] = {};
@@ -5214,6 +5240,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 return true;
                             }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
+                            if (px_on) {   // STRATA_PF_EXL3_FUSED: into the open group
+                                if (ne > 0) {
+                                    const uint8_t* bp = blob_dev;
+                                    if (slot >= 0) {   // streamed: its own copy, so the staging slot goes back now
+                                        pt.mark(kPfDequant, cs);
+                                        uint8_t* dst = reinterpret_cast<uint8_t*>(m.dq_gu[px.n]);
+                                        cudaMemcpyAsync(dst, blob_dev, (size_t) lay.blob_bytes(l), cudaMemcpyDeviceToDevice, m.cs);
+                                        bp = dst;
+                                    }
+                                    px.blob[px.n] = bp;
+                                    px.off[px.n] = (int32_t) o0;
+                                    px.cnt[px.n] = (int32_t) ne;
+                                    ++px.n;
+                                }
+                                if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; m.used_bid[slot] = 0; }
+                                if (px.n == px_max) px_flush();
+                                return true;
+                            }
                             if (pf_piece() > 0 && !m.pp && on_cpu.empty())
                                 return compute_pieces(j, blob_dev, slot, o0, ne);
                             static const int64_t gx_min = [] { const char* v = std::getenv("STRATA_PF_GU_EXACT_MINT"); return v ? (int64_t) std::atoll(v) : kGuExactMinT; }();   // (debug)
@@ -5340,6 +5384,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             release_to(m.g->n_expert);
                         }
                         gx_flush();   // STRATA_PF_GU_EXACT: the layer's last group
+                        px_flush();   // STRATA_PF_EXL3_FUSED: the layer's last group
                     }
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail, row_sd 1 (s_down is in them)

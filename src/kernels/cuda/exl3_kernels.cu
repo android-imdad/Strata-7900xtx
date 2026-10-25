@@ -1321,6 +1321,309 @@ void launch_fused(int64_t cap_groups, int64_t gy, const unsigned long long* grp_
 }
 }  // namespace v4
 
+// ---- the prompt path, grouped (exl3_pf_group): a group's experts on FP16 WMMA, the trellis decoded in the GEMM -------
+// Activations rotated per expert and role (x' = H(x * suh) per 128 inputs, FP16), the GEMM against W' with each weight
+// entering as 1024 + s (exact in FP16; w' = A s + B = A (1024 + s) + kBias), so y' = A (x' . (1024 + s)) + kBias
+// sum(x'): one correction a row and role.  Then the output side (H, svh / 128), SwiGLU, down's input rotation, the down
+// product, its output side.  Not the decode path's arithmetic (FP16 activations, FP32 WMMA sums): the prompt path's.
+namespace pf {
+constexpr int H = 2560, F = 640, MC = 64;   // the shape (as v4), rows a GEMM block
+typedef _Float16 h16 __attribute__((ext_vector_type(16)));
+typedef float f8 __attribute__((ext_vector_type(8)));
+typedef unsigned u8v __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ f8 wmma(h16 a, h16 b, f8 c) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#else
+    __builtin_trap();
+    return c;
+#endif
+}
+
+__device__ __forceinline__ int expert_of_rel(const Exl3PfGroup& g, int r) {
+    int e = 0;
+    while (e + 1 < g.n && g.rel[e + 1] <= r) ++e;
+    return e;
+}
+__device__ __forceinline__ int expert_of_mc(const Exl3PfGroup& g, int c) {
+    int e = 0;
+    while (e + 1 < g.n && g.mc0[e + 1] <= c) ++e;
+    return e;
+}
+
+__device__ __forceinline__ __half hsat(float v) { return __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f)); }
+
+__device__ __forceinline__ float wave_sum(float v) {
+    v += xor_lane<16>(v);
+    v += xor_lane<8>(v);
+    v += xor_lane<4>(v);
+    v += xor_lane<2>(v);
+    v += xor_lane<1>(v);
+    return v;
+}
+
+// a wave a (group row, role): x' = H(x * suh) to FP16 - into the row's Dm (the down product's output, 2 n_embd halves:
+// both roles' x', dead before the down product writes the row) - and the sum of those FP16 values (rs[3 row + role])
+template <int GK2, int DK2>
+__global__ void __launch_bounds__(256) xform_in_kernel(Exl3PfGroup g, const __half* __restrict__ Xs, float* Dm, float* rs) {
+    const int lane = (int) (threadIdx.x & 31), gw = (int) (blockIdx.x * 8 + (threadIdx.x >> 5));
+    const int R = g.rel[g.n], r = gw >> 1, role = gw & 1;
+    if (r >= R) return;
+    const int e = expert_of_rel(g, r);
+    const size_t abs_row = (size_t) g.off[e] + (size_t) (r - g.rel[e]);
+    const RoleView m = role_view(g.blob[e], role, H, F, GK2, DK2);
+    float tot = 0.f;
+    for (int j = 0; j < H / 128; ++j) {
+        const uint2 xv = *reinterpret_cast<const uint2*>(Xs + abs_row * H + 128 * j + 4 * lane);
+        const __half2 x01 = *reinterpret_cast<const __half2*>(&xv.x), x23 = *reinterpret_cast<const __half2*>(&xv.y);
+        float v[4] = {__low2float(x01), __high2float(x01), __low2float(x23), __high2float(x23)};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) v[k] = v[k] * __half2float(m.suh[128 * j + 4 * lane + k]);
+        had128_wave(v);
+        __half hv[4];
+        float part = 0.f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { hv[k] = hsat(v[k]); part += __half2float(hv[k]); }
+        __half2 o01 = __halves2half2(hv[0], hv[1]), o23 = __halves2half2(hv[2], hv[3]);
+        uint2 ov;
+        ov.x = *reinterpret_cast<uint32_t*>(&o01);
+        ov.y = *reinterpret_cast<uint32_t*>(&o23);
+        *reinterpret_cast<uint2*>(reinterpret_cast<__half*>(Dm + abs_row * H) + (size_t) role * H + 128 * j + 4 * lane) = ov;
+        tot += wave_sum(part);
+    }
+    if (lane == 0) rs[3 * abs_row + (size_t) role] = tot;
+}
+
+// the lane's B fragment of one tile at one k-tile: column c = lane % 16, its 16 steps (exl3_expert.hpp's placement:
+// chunk c % 8, the steps with bit 2 = c / 8), each as the FP16 1024 + s, row r of the column in half r
+template <int K2>
+__device__ __forceinline__ void tile_column(const uint32_t (&w)[3], int lane, uint32_t (&B)[8]) {
+    const int l8 = lane & 7, bsel = (lane >> 3) & 1;
+    uint32_t X[4];
+    v4::align_words<K2>(w, l8, X);
+    // steps 4 bsel + 8 j + i: shift the window by bsel's 4 steps (2 K2 bits) so the offsets are compile-time
+    constexpr int D = 2 * K2;
+    if (bsel) {
+        X[0] = __builtin_amdgcn_alignbit(X[0], X[1], 32 - D);
+        X[1] = __builtin_amdgcn_alignbit(X[1], X[2], 32 - D);
+        X[2] = __builtin_amdgcn_alignbit(X[2], X[3], 32 - D);
+        X[3] = X[3] << D;
+    }
+    uint32_t v[2][8];
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int j = 2 * h + (k >> 2), i = k & 3, u = 8 * j + i;
+            const int e = v4::end_bit<K2>(u), wi = e >> 5, o = e & 31;
+            v[h][k] = o == 0 ? X[wi] : __builtin_amdgcn_alignbit(X[wi], X[wi + 1 < 4 ? wi + 1 : 3], 32 - o);
+        }
+    v4::bsum8(v[0]);
+    v4::bsum8(v[1]);
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+        for (int jj = 0; jj < 2; ++jj) {
+            const int j = 2 * h + jj;
+            // rows 2 j (i 0), 2 j + 1 (i 1) -> register j; rows 2 j + 8 (i 2), 2 j + 9 (i 3) -> register 4 + j
+            B[j] = (v[h][4 * jj + 0] + 0x6400u) | ((v[h][4 * jj + 1] + 0x6400u) << 16);
+            B[4 + j] = (v[h][4 * jj + 2] + 0x6400u) | ((v[h][4 * jj + 3] + 0x6400u) << 16);
+        }
+}
+
+__device__ __forceinline__ uint32_t swap_halves(uint32_t v) {   // lane l <- lane l ^ 16
+    return (uint32_t) __builtin_amdgcn_permlanex16((int) v, (int) v, 0x76543210, 0xfedcba98, false, false);
+}
+
+__device__ __forceinline__ h16 load_a(const __half* p) {   // 16 consecutive halves
+    const uint4 a = reinterpret_cast<const uint4*>(p)[0], b = reinterpret_cast<const uint4*>(p)[1];
+    u8v u = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    return __builtin_bit_cast(h16, u);
+}
+
+// gate/up: a block (8 waves) per (expert, 64-row chunk, 128 outputs of each role); wave w: role w / 4, tile columns
+// 2 (w % 4) + {0, 1} of the 8; a half-wave decodes one tile (a lane a column), the halves swapped for the other's
+template <int K2>
+__global__ void __launch_bounds__(256) gemm_gu_kernel(Exl3PfGroup g, int gk2, int dk2, const float* __restrict__ Dm,
+                                                      const float* __restrict__ rs, float* GU) {
+    const int lane = (int) (threadIdx.x & 31), wave = (int) (threadIdx.x >> 5);
+    const int ob = (int) blockIdx.x % (F / 128), mcg = (int) blockIdx.x / (F / 128);
+    if (mcg >= g.mc0[g.n]) return;
+    const int e = expert_of_mc(g, mcg), row0 = MC * (mcg - g.mc0[e]), nrow = min(MC, g.cnt[e] - row0);
+    const int role = wave >> 2, tt = lane >> 4;
+    const int tn = 8 * ob + 2 * (wave & 3) + tt;
+    const RoleView m = role_view(g.blob[e], role, H, F, gk2, dk2);
+    const size_t kstep = (size_t) (F / 16) * (size_t) (4 * K2);
+    const uint32_t* wp = reinterpret_cast<const uint32_t*>(m.trellis) + (size_t) tn * (4 * K2) + (size_t) ((K2 * ((lane & 15) & 7)) / 2);
+    const __half* xa[4];
+#pragma unroll
+    for (int ms = 0; ms < 4; ++ms) {
+        const int rr = min(row0 + 16 * ms + (lane & 15), g.cnt[e] - 1);
+        xa[ms] = reinterpret_cast<const __half*>(Dm + ((size_t) g.off[e] + (size_t) rr) * H) + (size_t) role * H;
+    }
+    f8 acc[4][2];
+#pragma unroll
+    for (int ms = 0; ms < 4; ++ms) acc[ms][0] = acc[ms][1] = f8{0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t w0[3], w1[3];
+    v4::load3(wp, w0);
+    v4::load3(wp + kstep, w1);
+    auto step = [&](int kt, uint32_t (&w)[3]) {
+        uint32_t Bm[8];
+        tile_column<K2>(w, lane, Bm);
+        v4::load3(wp + (size_t) min(kt + 2, H / 16 - 1) * kstep, w);
+        uint32_t ba[8], bb[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t o = swap_halves(Bm[i]);
+            ba[i] = tt == 0 ? Bm[i] : o;
+            bb[i] = tt == 0 ? o : Bm[i];
+        }
+        const h16 BA = __builtin_bit_cast(h16, u8v{ba[0], ba[1], ba[2], ba[3], ba[4], ba[5], ba[6], ba[7]});
+        const h16 BB = __builtin_bit_cast(h16, u8v{bb[0], bb[1], bb[2], bb[3], bb[4], bb[5], bb[6], bb[7]});
+#pragma unroll
+        for (int ms = 0; ms < 4; ++ms) {
+            const h16 A = load_a(xa[ms] + 16 * kt);
+            acc[ms][0] = wmma(A, BA, acc[ms][0]);
+            acc[ms][1] = wmma(A, BB, acc[ms][1]);
+        }
+    };
+#pragma unroll 1
+    for (int kt = 0; kt < H / 16; kt += 2) {
+        step(kt, w0);
+        step(kt + 1, w1);
+    }
+    // C lane l: rows 2 i + l / 16, column l % 16 of each 16 x 16
+#pragma unroll
+    for (int ms = 0; ms < 4; ++ms)
+#pragma unroll
+        for (int t = 0; t < 2; ++t)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int rr = 16 * ms + 2 * i + (lane >> 4);
+                if (rr >= nrow) continue;
+                const int row = row0 + rr, col = 16 * (8 * ob + 2 * (wave & 3) + t) + (lane & 15);
+                const float s = rs[3 * ((size_t) g.off[e] + (size_t) row) + (size_t) role];
+                GU[((size_t) g.off[e] + (size_t) row) * (2 * F) + 2 * (size_t) col + (size_t) role] = ex::kA * acc[ms][t][i] + ex::kBias * s;
+            }
+}
+
+// a wave a group row: gate / up output sides (H, svh / 128), SwiGLU, down's input rotation (h * suh_d, H) to FP16 Hh,
+// and the sum of those FP16 values
+template <int GK2, int DK2>
+__global__ void __launch_bounds__(256) gu_post_kernel(Exl3PfGroup g, const float* __restrict__ GU, __half* Hh, float* rs) {
+    const int lane = (int) (threadIdx.x & 31), r = (int) (blockIdx.x * 8 + (threadIdx.x >> 5));
+    const int R = g.rel[g.n];
+    if (r >= R) return;
+    const int e = expert_of_rel(g, r);
+    const size_t abs_row = (size_t) g.off[e] + (size_t) (r - g.rel[e]);
+    const RoleView mg = role_view(g.blob[e], 0, H, F, GK2, DK2), mu = role_view(g.blob[e], 1, H, F, GK2, DK2),
+                   md = role_view(g.blob[e], 2, H, F, GK2, DK2);
+    float tot = 0.f;
+    for (int b = 0; b < F / 128; ++b) {
+        const float4 p0 = *reinterpret_cast<const float4*>(GU + abs_row * (2 * F) + 2 * (128 * b + 4 * lane));
+        const float4 p1 = *reinterpret_cast<const float4*>(GU + abs_row * (2 * F) + 2 * (128 * b + 4 * lane) + 4);
+        float gv[4] = {p0.x, p0.z, p1.x, p1.z}, uv[4] = {p0.y, p0.w, p1.y, p1.w}, h[4];
+        had128_wave(gv);
+        had128_wave(uv);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int c = 128 * b + 4 * lane + k;
+            const float gg = gv[k] * (1.0f / 128.0f) * __half2float(mg.svh[c]);
+            const float u = uv[k] * (1.0f / 128.0f) * __half2float(mu.svh[c]);
+            h[k] = gg / (1.0f + __expf(-gg)) * u * __half2float(md.suh[c]);
+        }
+        had128_wave(h);
+        __half hv[4];
+        float part = 0.f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { hv[k] = hsat(h[k]); part += __half2float(hv[k]); }
+        __half2 o01 = __halves2half2(hv[0], hv[1]), o23 = __halves2half2(hv[2], hv[3]);
+        uint2 ov;
+        ov.x = *reinterpret_cast<uint32_t*>(&o01);
+        ov.y = *reinterpret_cast<uint32_t*>(&o23);
+        *reinterpret_cast<uint2*>(Hh + abs_row * F + 128 * b + 4 * lane) = ov;
+        tot += wave_sum(part);
+    }
+    if (lane == 0) rs[3 * abs_row + 2] = tot;
+}
+
+// down: a block (4 waves) per (expert, 64-row chunk, 128 outputs); wave w tile columns 2 w + {0, 1}; the output side
+// (H over the 128, svh / 128) through LDS
+template <int K2>
+__global__ void __launch_bounds__(128) gemm_d_kernel(Exl3PfGroup g, int gk2, int dk2, const __half* __restrict__ Hh,
+                                                     const float* __restrict__ rs, float* Dm) {
+    __shared__ float ys[MC][128 + 1];
+    const int lane = (int) (threadIdx.x & 31), wave = (int) (threadIdx.x >> 5);
+    const int ob = (int) blockIdx.x % (H / 128), mcg = (int) blockIdx.x / (H / 128);
+    if (mcg >= g.mc0[g.n]) return;
+    const int e = expert_of_mc(g, mcg), row0 = MC * (mcg - g.mc0[e]), nrow = min(MC, g.cnt[e] - row0);
+    const int tt = lane >> 4, tn = 8 * ob + 2 * wave + tt;
+    const RoleView m = role_view(g.blob[e], 2, H, F, gk2, dk2);
+    const size_t kstep = (size_t) (H / 16) * (size_t) (4 * K2);
+    const uint32_t* wp = reinterpret_cast<const uint32_t*>(m.trellis) + (size_t) tn * (4 * K2) + (size_t) ((K2 * ((lane & 15) & 7)) / 2);
+    const __half* xa[4];
+#pragma unroll
+    for (int ms = 0; ms < 4; ++ms) {
+        const int rr = min(row0 + 16 * ms + (lane & 15), g.cnt[e] - 1);
+        xa[ms] = Hh + ((size_t) g.off[e] + (size_t) rr) * F;
+    }
+    f8 acc[4][2];
+#pragma unroll
+    for (int ms = 0; ms < 4; ++ms) acc[ms][0] = acc[ms][1] = f8{0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t w0[3], w1[3];
+    v4::load3(wp, w0);
+    v4::load3(wp + kstep, w1);
+    auto step = [&](int kt, uint32_t (&w)[3]) {
+        uint32_t Bm[8];
+        tile_column<K2>(w, lane, Bm);
+        v4::load3(wp + (size_t) min(kt + 2, F / 16 - 1) * kstep, w);
+        uint32_t ba[8], bb[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t o = swap_halves(Bm[i]);
+            ba[i] = tt == 0 ? Bm[i] : o;
+            bb[i] = tt == 0 ? o : Bm[i];
+        }
+        const h16 BA = __builtin_bit_cast(h16, u8v{ba[0], ba[1], ba[2], ba[3], ba[4], ba[5], ba[6], ba[7]});
+        const h16 BB = __builtin_bit_cast(h16, u8v{bb[0], bb[1], bb[2], bb[3], bb[4], bb[5], bb[6], bb[7]});
+#pragma unroll
+        for (int ms = 0; ms < 4; ++ms) {
+            const h16 A = load_a(xa[ms] + 16 * kt);
+            acc[ms][0] = wmma(A, BA, acc[ms][0]);
+            acc[ms][1] = wmma(A, BB, acc[ms][1]);
+        }
+    };
+#pragma unroll 1
+    for (int kt = 0; kt < F / 16; kt += 2) {
+        step(kt, w0);
+        step(kt + 1, w1);
+    }
+#pragma unroll
+    for (int ms = 0; ms < 4; ++ms)
+#pragma unroll
+        for (int t = 0; t < 2; ++t)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int rr = 16 * ms + 2 * i + (lane >> 4);
+                const float s = rr < nrow ? rs[3 * ((size_t) g.off[e] + (size_t) (row0 + rr)) + 2] : 0.f;
+                ys[rr][16 * (2 * wave + t) + (lane & 15)] = ex::kA * acc[ms][t][i] + ex::kBias * s;
+            }
+    __syncthreads();
+    for (int rr = wave; rr < nrow; rr += 4) {
+        float v[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) v[k] = ys[rr][4 * lane + k];
+        had128_wave(v);
+        float y[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) y[k] = v[k] * (1.0f / 128.0f) * __half2float(m.svh[128 * ob + 4 * lane + k]);
+        *reinterpret_cast<float4*>(Dm + ((size_t) g.off[e] + (size_t) (row0 + rr)) * H + 128 * ob + 4 * lane) =
+            make_float4(y[0], y[1], y[2], y[3]);
+    }
+}
+}  // namespace pf
+
 bool v4_path() {
     static const bool on = [] { const char* e = std::getenv("STRATA_EXL3_V4"); return !(e && e[0] == '0'); }();
     return on;
@@ -1703,6 +2006,47 @@ void exl3_dequant_left_f16(int gu_type, int d_type, const void* blob, int64_t n_
         default: dequant_left3_kernel<0><<<grid, 128, 0, s>>>(b8, (int) n_embd, (int) n_ff, gk2, dk2, g16, d16); break;
     }
     check_launch("exl3_dequant_left_f16");
+}
+
+
+bool exl3_pf_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) {
+    const int gk2 = ex::k2_of(gu_type), dk2 = ex::k2_of(d_type);
+    return n_embd == pf::H && n_ff == pf::F && (gk2 == 5 || gk2 == 6) && (dk2 == 5 || dk2 == 6);
+}
+
+void exl3_pf_group(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const Exl3PfGroup& in, const uint16_t* Xs,
+                   float* GU, uint16_t* Hh, float* Dm, float* rs, void* stream) {
+    const int gk2 = ex::k2_of(gu_type), dk2 = ex::k2_of(d_type);
+    if (!exl3_pf_supported(gu_type, d_type, n_embd, n_ff) || in.n <= 0 || in.n > 16) {
+        std::fprintf(stderr, "exl3_pf_group: types %d/%d, %lld x %lld, %d experts\n", gu_type, d_type, (long long) n_embd,
+                     (long long) n_ff, in.n);
+        std::exit(1);
+    }
+    Exl3PfGroup g = in;
+    g.rel[0] = 0;
+    g.mc0[0] = 0;
+    for (int e = 0; e < g.n; ++e) {
+        g.rel[e + 1] = g.rel[e] + g.cnt[e];
+        g.mc0[e + 1] = g.mc0[e] + (g.cnt[e] + pf::MC - 1) / pf::MC;
+    }
+    const int R = g.rel[g.n];
+    if (R <= 0) return;
+    cudaStream_t s = (cudaStream_t) stream;
+    const __half* X = reinterpret_cast<const __half*>(Xs);
+    __half* Hhh = reinterpret_cast<__half*>(Hh);
+    const unsigned b1 = (unsigned) ((2 * R + 7) / 8), b3 = (unsigned) ((R + 7) / 8);
+    const unsigned b2 = (unsigned) (g.mc0[g.n] * (pf::F / 128)), b4 = (unsigned) (g.mc0[g.n] * (pf::H / 128));
+#define STRATA_PF(GK, DK) do { \
+        pf::xform_in_kernel<GK, DK><<<b1, 256, 0, s>>>(g, X, Dm, rs); \
+        pf::gemm_gu_kernel<GK><<<b2, 256, 0, s>>>(g, gk2, dk2, Dm, rs, GU); \
+        pf::gu_post_kernel<GK, DK><<<b3, 256, 0, s>>>(g, GU, Hhh, rs); \
+        pf::gemm_d_kernel<DK><<<b4, 128, 0, s>>>(g, gk2, dk2, Hhh, rs, Dm); } while (0)
+    if (gk2 == 5 && dk2 == 5) STRATA_PF(5, 5);
+    else if (gk2 == 6 && dk2 == 6) STRATA_PF(6, 6);
+    else if (gk2 == 5) STRATA_PF(5, 6);
+    else STRATA_PF(6, 5);
+#undef STRATA_PF
+    check_launch("exl3_pf_group");
 }
 
 void exl3_rotate_gu_out(float* gu, int64_t rows, int64_t n_ff, const uint16_t* svh_gu, void* stream) {
