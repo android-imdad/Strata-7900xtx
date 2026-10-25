@@ -12,6 +12,10 @@
 
 #include "strata/kernels/exl3_expert.hpp"
 
+#if defined(STRATA_USE_HIP) && !defined(cudaGetSymbolAddress)
+#define cudaGetSymbolAddress hipGetSymbolAddress   // (not in hip_compat/cuda_runtime.h)
+#endif
+
 namespace strata::kernels {
 namespace {
 
@@ -850,6 +854,15 @@ bool v1_path() {
     static const bool v1 = [] { const char* e = std::getenv("STRATA_EXL3_V1"); return e && e[0] == '1'; }();
     return v1;
 }
+// ---- the fused kernels' counters ------------------------------------------------------------------------------------
+// By entry index (a group's first entry; a PCIe pass's entries follow the VRAM pass's), in their own device arrays: in
+// the scratch they moved with the call's cap (a 7-token window's counters were an 8-token window's entries - a hang)
+// and another layer's kernels may write the scratch.  Zero at load; every launch leaves them zero.
+constexpr int kCntEntries = 512;    // entries a call (a verify window: <= 8 tokens x top-k); more: the unfused v3
+constexpr int kCntBlocks = 64;      // v3's fused tail: (n_ff + n_embd) / 128 counters an entry at most
+__device__ unsigned g_cnt3[kCntEntries * kCntBlocks];
+__device__ unsigned g_cnt4[4 * kCntEntries];
+
 // ---- v4 (default): one launch ---------------------------------------------------------------------------------------
 // The spike's fused window (tools-3p/exl3/spike fused_window2) in the parity arithmetic.  Blocks of 20 waves in three
 // ranges, dispatched in order: input transforms (a block per group and gate/up role: wave j rotates and quantizes input
@@ -1330,15 +1343,17 @@ void exl3_v4_timeline_dump(const char* path, int nblocks) {
 
 size_t exl3_expert_scratch_bytes(int64_t cap, int64_t n_embd, int64_t n_ff) {
     const EntLay L(n_embd, n_ff);
-    // entries, the entry -> group map, then the fused tails' counters ([cap][n_ff / 128] + [cap][n_embd / 128])
-    return (size_t) cap * L.bytes + (size_t) cap * sizeof(int32_t) + (size_t) cap * (size_t) ((n_ff + n_embd) / 128 + 4) * 4u + 256;
+    // entries, then the entry -> group map (the fused kernels' counters are device arrays: g_cnt3 / g_cnt4)
+    return (size_t) cap * L.bytes + (size_t) cap * sizeof(int32_t) + 256;
 }
 
 void exl3_expert_scratch_init(void* scratch, int64_t cap, int64_t n_embd, int64_t n_ff) {
-    if (scratch == nullptr || cap <= 0) return;
-    const EntLay L(n_embd, n_ff);
-    uint8_t* c = static_cast<uint8_t*>(scratch) + (size_t) cap * L.bytes + (size_t) cap * sizeof(int32_t);
-    cudaMemset(c, 0, (size_t) cap * (size_t) ((n_ff + n_embd) / 128 + 4) * 4u);
+    (void) scratch; (void) cap; (void) n_embd; (void) n_ff;
+    // the counters are zero at load and after every launch; zeroed again here (a process that aborted a launch)
+    void* p = nullptr;
+    if (cudaGetSymbolAddress(&p, HIP_SYMBOL(g_cnt3)) == cudaSuccess) cudaMemset(p, 0, sizeof(g_cnt3));
+    if (cudaGetSymbolAddress(&p, HIP_SYMBOL(g_cnt4)) == cudaSuccess) cudaMemset(p, 0, sizeof(g_cnt4));
+    cudaGetLastError();
 }
 
 void exl3_expert_grouped(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const unsigned long long* grp_ptr,
@@ -1357,10 +1372,13 @@ void exl3_expert_grouped(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, 
     int32_t* ent_grp = reinterpret_cast<int32_t*>(sc + (size_t) cap_entries * L.bytes);
     const int cap = (int) cap_entries;
     auto v3_k2 = [](int k2) { return k2 == 5 || k2 == 6 || k2 == 7; };
-    if (!v1_path() && !v2_path() && v4_path() && H == v4::H && F == v4::F && (gk2 == 5 || gk2 == 6) && (dk2 == 5 || dk2 == 6)) {
-        // v4 (default): one launch; its counters after v3's
-        unsigned* cnt = reinterpret_cast<unsigned*>(sc + (size_t) cap_entries * L.bytes + (size_t) cap_entries * sizeof(int32_t)) +
-                        (size_t) cap_entries * (size_t) ((F + H) / 128);
+    static unsigned* const cnt3 = [] { void* p = nullptr; return cudaGetSymbolAddress(&p, HIP_SYMBOL(g_cnt3)) == cudaSuccess ? (unsigned*) p : nullptr; }();
+    static unsigned* const cnt4 = [] { void* p = nullptr; return cudaGetSymbolAddress(&p, HIP_SYMBOL(g_cnt4)) == cudaSuccess ? (unsigned*) p : nullptr; }();
+    if (!v1_path() && !v2_path() && v4_path() && H == v4::H && F == v4::F && (gk2 == 5 || gk2 == 6) && (dk2 == 5 || dk2 == 6) &&
+        cap_entries <= kCntEntries && cnt4 != nullptr) {
+        // v4 (default): one launch
+        unsigned* cnt = cnt4;
+        const int cap = kCntEntries;   // the counters' layout (the call's own cap moves nothing)
         const int qm = ex::act_qmax();
         if (gk2 == 5 && dk2 == 5) v4::launch_fused<5, 5>(cap_groups, group_rows, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, x, sc, cnt, cap, out, qm, s);
         else if (gk2 == 6 && dk2 == 6) v4::launch_fused<6, 6>(cap_groups, group_rows, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, x, sc, cnt, cap, out, qm, s);
@@ -1379,10 +1397,11 @@ void exl3_expert_grouped(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, 
         prep3_kernel<<<dim3(gcap, 2, (H / 128 + 3) / 4), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_tok, x, sc, H, F,
                                                            gk2, dk2, qm);
         static const bool fuse = [] { const char* v = std::getenv("STRATA_EXL3_FUSE"); return !(v && v[0] == '0'); }();
-        if (fuse) {   // three launches: the post kernels' work in the band kernels' last waves (the counters after the map)
+        if (fuse && cap_entries <= kCntEntries && (F + H) / 128 <= kCntBlocks && cnt3 != nullptr) {
+            // three launches: the post kernels' work in the band kernels' last waves
             BandFuse fu;
-            fu.cnt = reinterpret_cast<unsigned*>(sc + (size_t) cap_entries * L.bytes + (size_t) cap_entries * sizeof(int32_t));
-            fu.cnt_cap = cap;
+            fu.cnt = cnt3;
+            fu.cnt_cap = kCntEntries;
             fu.ent_dst = ent_dst;
             fu.out = out;
             fu.qm = qm;

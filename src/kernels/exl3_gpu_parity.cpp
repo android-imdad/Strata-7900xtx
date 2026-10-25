@@ -155,6 +155,19 @@ int main(int argc, char** argv) {
         std::printf("layer %2d expert %3d (types %d/%d): checked\n", key.first, key.second, f.gt, f.dt);
     }
     std::printf("%s: %d of %d checks bit-exact\n", fails ? "FAILED" : "OK", checks - fails, checks);
+    auto recheck = [&](const char* what) {   // the first expert's records again, after launches with another cap
+        const auto& [key, idx] = *by.begin();
+        const LayerFmt& f = lay.at(key.first);
+        load(key.first, key.second, d_blob[0]);
+        std::vector<std::vector<float>> ys;
+        const int before = fails;
+        for (int r : idx) { run(f, {{r}}, ys); cmp(ys[0], r, what); }
+        std::vector<int> grp = idx;
+        for (int i = 0; (int) grp.size() < 8 && i < nrec; ++i) if (recs[(size_t) i].layer != key.first) grp.push_back(i);
+        run(f, {grp}, ys);
+        for (size_t i = 0; i < idx.size(); ++i) cmp(ys[i], idx[i], what);
+        std::printf("%s: %s\n", what, fails == before ? "bit-exact" : "FAILED");
+    };
     if (bench) {
         const LayerFmt& f = lay.at(bench_layer);
         const int NG = 32, NE = 40, CAPB = 40;   // a 4-token window: cap = 4 x top-10
@@ -213,6 +226,7 @@ int main(int argc, char** argv) {
         cudaEventSynchronize(b);
         float gms = 0.f;
         cudaEventElapsedTime(&gms, a, b);
+        recheck("after the bench's cap-40 launches (counters by entry, not by the call's cap)");
         if (const char* tl = std::getenv("STRATA_EXL3_TL")) {   // (debug) one more launch, its v4 timeline
             cudaDeviceSynchronize();
             if (std::getenv("STRATA_EXL3_TL_B2B")) call();   // (after another: their boundary)
