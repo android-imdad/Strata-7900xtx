@@ -1709,8 +1709,10 @@ if(STRATA_NATIVE_EXPERTS)
                                            src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
                                            src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
                                            src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp
-                                           src/kernels/cpu/replica_avx512.cpp)
+                                           src/kernels/cpu/replica_avx512.cpp src/kernels/cpu/exl3_cpu.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
+  # EXL3 experts (exl3_expert.hpp's parity arithmetic): every product and sum rounded on its own, like the GPU's
+  set_source_files_properties(src/kernels/cpu/exl3_cpu.cpp PROPERTIES COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:MSVC>,/fp:precise,-ffp-contract=off>")
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp
                                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
@@ -1778,6 +1780,9 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp) bit for bit against each other at 1..8 tokens and
   # against ggml-cpu's dot, on random blocks; --bench: ms per expert on one thread, the weights streamed from DRAM
+  # the EXL3 experts on the CPU bit for bit against tools/exl3_ref.py (a pack and a fixture: no test without them)
+  add_executable(exl3_cpu_parity src/kernels/cpu/exl3_cpu_parity.cpp)
+  target_link_libraries(exl3_cpu_parity PRIVATE strata_kernels_cpu)
   add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
   target_link_libraries(iq_avx2_parity PRIVATE strata_kernels_cpu)
   # MODEL-UPDATE: the pool's expert rows per format on T threads against the RAM bandwidth (a benchmark, no test)
