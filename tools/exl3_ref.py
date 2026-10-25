@@ -232,6 +232,8 @@ def main() -> int:
     ap.add_argument("--layers", default="0,4")
     ap.add_argument("--experts", type=int, default=2)
     ap.add_argument("--golden", action="store_true")
+    ap.add_argument("--dequant-check", nargs=2, metavar=("LAYER:EXPERT", "BIN"),
+                    help="compare exl3_dequant_check's FP16 output with the float64 weight")
     ap.add_argument("--fixture", type=pathlib.Path, help="write x, h and y of --experts per layer, 2 inputs each, "
                     "for exl3_cpu_parity / exl3_replica")
     a = ap.parse_args()
@@ -240,6 +242,24 @@ def main() -> int:
     if a.golden:
         golden(pack, layers, a.experts)
     rng = np.random.default_rng(0)
+    if a.dequant_check:
+        l, e = (int(v) for v in a.dequant_check[0].split(":"))
+        raw = np.fromfile(a.dequant_check[1], np.float16)
+        H, FF = pack.H, pack.FF
+        gu = raw[:2 * FF * H].reshape(2 * FF, H).astype(np.float64)
+        dn = raw[2 * FF * H:].reshape(H, FF).astype(np.float64)
+        Hm = had_matrix()
+        def full(tr, suh, svh, k, n, K2):   # W [k][n] = diag(suh) H W' H diag(svh) / 128
+            w = decode(tr, k, n, K2).astype(np.float64) * float(A) + float(B)
+            Hb = np.kron(np.eye(k // 128), Hm)
+            Hn = np.kron(np.eye(n // 128), Hm)
+            return (suh.astype(np.float64)[:, None] * (Hb @ w @ Hn)) * svh.astype(np.float64)[None, :] / 128.0
+        parts = pack.expert(l, e)
+        for name, got, want in (("gate", gu[0::2], full(*parts[0]).T), ("up", gu[1::2], full(*parts[1]).T),
+                                ("down", dn, full(*parts[2]).T)):
+            rel = np.sqrt(((got - want) ** 2).sum() / (want ** 2).sum())
+            print("dequant layer %d expert %d %s: rel RMS vs float64 %.2e (FP16 rounding is ~3e-4)" % (l, e, name, rel))
+        return 0
     if a.fixture:
         recs = []
         for l in layers:

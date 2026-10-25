@@ -3481,6 +3481,20 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
             const auto& f = lay.fmt[(size_t) l];
+            // EXL3 experts (tools/exl3_pack.py): the CPU rows and the prompt path's dequantizer exist; the GPU decode
+            // kernels do not yet, so STRATA_EXL3_CPU_DECODE=1 runs every decode expert on the CPU (no VRAM expert cache,
+            // no PCIe share) - the quality check before the GPU work.
+            if (f.exl3_gu) {
+                static const bool cpu_only = [] { const char* v = std::getenv("STRATA_EXL3_CPU_DECODE"); return v && v[0] == '1'; }();
+                if (!cpu_only || o.expert_cache != 0 || o.pcie_frac != 0.0 || !o.expert_profile.empty()) {
+                    std::fprintf(stderr, "strata generate: layer %lld's experts are EXL3 (K %.1f/%.1f), which have no GPU decode "
+                                         "kernels yet: run with STRATA_EXL3_CPU_DECODE=1 --expert-cache 0 --pcie-frac 0 and no "
+                                         "--expert-profile (every decode expert on the CPU)\n",
+                                 (long long) l, f.exl3_gu / 2.0, f.exl3_d / 2.0);
+                    return 1;
+                }
+                continue;
+            }
             if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
                 std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
                                      "engine has no GPU kernels for\n", (long long) l,

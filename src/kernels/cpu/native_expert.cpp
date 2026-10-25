@@ -2,6 +2,7 @@
 // See the header.  Nothing here is Strata arithmetic: the activation quantizers and the row dot products are
 // ggml-cpu's, so an IQ expert computes what llama.cpp's CPU backend computes for it.
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
@@ -65,6 +66,29 @@ bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     init_once();
+    // EXL3 (exllamav3 trellis, tools/exl3_pack.py): not ggml types at all.  The blob is [trellis | suh | svh] per role;
+    // the activations stay F32 (each expert rotates and quantizes them itself, exl3_cpu.hpp), so act/h are floats.
+    if (exl3::is_exl3(gu_type) || exl3::is_exl3(d_type)) {
+        if (!exl3::is_exl3(gu_type) || !exl3::is_exl3(d_type) || n_embd % 128 || n_ff % 128 || n_embd > exl3c::kMaxK ||
+            n_ff > exl3c::kMaxK) {
+            err = "native experts: an EXL3 layer needs EXL3 gate/up and down, widths a multiple of 128 up to " +
+                  std::to_string(exl3c::kMaxK);
+            return false;
+        }
+        f = NativeFmt{};
+        f.gu_type = gu_type;
+        f.d_type = d_type;
+        f.exl3_gu = exl3::k2_of(gu_type);
+        f.exl3_d = exl3::k2_of(d_type);
+        f.n_embd = n_embd;
+        f.n_ff = n_ff;
+        f.up_off = exl3::role_bytes(n_embd, n_ff, f.exl3_gu);
+        f.down_off = 2 * f.up_off;
+        f.bytes = f.down_off + exl3::role_bytes(n_ff, n_embd, f.exl3_d);
+        f.act_bytes = (size_t) n_embd * sizeof(float);
+        f.h_bytes = (size_t) n_ff * sizeof(float);
+        return true;
+    }
     // The trellis types (Gyro, ggml types 144-146) are not in a ggml built from upstream (and an upstream ggml indexes its
     // type table by the id, so asking it about 144 reads past the table): their geometry and activation format (Q8_0)
     // are known here, and their rows run on tq_cpu.hpp.
@@ -154,6 +178,7 @@ bool cpu_parity_init(bool gpu_sexp, std::string& why) {
         }
     for (size_t l = 0; l < lay.fmt.size(); ++l) {
         const auto& f = lay.fmt[l];
+        if (f.exl3_gu) continue;   // EXL3 layers: exl3_cpu.hpp IS the GPU's arithmetic (exl3_expert.hpp), no replica needed
         if (!replica::gu_supported(f.gu_type) || !replica::down_supported(f.d_type) || f.n_embd != 2560 || f.n_ff != 640) {
             why = "layer " + std::to_string(l) + "'s formats (ggml types " + std::to_string(f.gu_type) + "/" +
                   std::to_string(f.d_type) + ") are not in the replica";
@@ -249,6 +274,7 @@ void act_dump_record(int layer, int kind, const float* v, int64_t n) {
 }  // namespace
 
 void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
+    if (f.exl3_gu) { std::memcpy(dst, x, f.act_bytes); return; }   // EXL3: F32, rotated per expert (exl3_cpu.hpp)
     if (f.had_gu) {   // Hadamard-folded gate/up: quantize H (s * x), never x itself (hadamard.hpp)
         thread_local std::vector<float> tmp;
         tmp.assign(x, x + f.n_embd);
@@ -263,6 +289,7 @@ void native_quant_act(const NativeFmt& f, const float* x, void* dst) {
 }
 
 void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
+    if (f.exl3_d) { std::memcpy(dst, h, f.h_bytes); return; }
     if (f.had_d) {
         thread_local std::vector<float> tmp;
         tmp.assign(h, h + f.n_ff);
@@ -297,6 +324,10 @@ int native_gu_mt_min(int gu_type) {
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
+    if (f.exl3_gu) {   // the pool runs EXL3 layers by 128-output blocks (ExpertPool::run_exl3), never by rows
+        std::fprintf(stderr, "native_gu_rows: an EXL3 layer reached the row kernels\n");
+        std::abort();
+    }
     if (g_parity) {
         replica::gu_rows(f.gu_type, nt, blob, f.gu_row, f.up_off, reinterpret_cast<const replica::ActX* const*>(act), ff, r0, r1);
         return;
@@ -413,6 +444,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
 
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1) {
+    if (f.exl3_d) {
+        std::fprintf(stderr, "native_down_rows: an EXL3 layer reached the row kernels\n");
+        std::abort();
+    }
     if (g_parity) {
         replica::down_rows(f.d_type, nt, blob + f.down_off, f.d_row, reinterpret_cast<const replica::ActH* const*>(hq), out, r0, r1);
         return;

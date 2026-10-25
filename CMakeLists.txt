@@ -422,6 +422,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/dflash2.cu
                           src/kernels/cuda/iq_kernels.cu
+                          src/kernels/cuda/exl3_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -2144,6 +2145,10 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(native_expert_parity PRIVATE ${_strata_gpu_include_directories})
     # strata_engine: the --load-check mode runs the engine's start-up checks (NativeDense, check_experts_gguf)
     target_link_libraries(native_expert_parity PRIVATE strata_engine strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
+    # the prompt path's EXL3 dequantizer on a real expert (compared by tools/exl3_ref.py --dequant-check)
+    add_executable(exl3_dequant_check src/kernels/exl3_dequant_check.cpp)
+    target_include_directories(exl3_dequant_check PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(exl3_dequant_check PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_executable(native_expert_bench src/kernels/native_expert_bench.cpp)
     target_include_directories(native_expert_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(native_expert_bench PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})

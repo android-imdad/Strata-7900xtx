@@ -1196,6 +1196,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+        } else if (mode_ >= 10) {
+            exl3_task(i);
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows (the layer's own n_ff / n_embd: Flash-Next's
             // FF / H, or another family's smaller expert)
@@ -1356,6 +1358,64 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+void ExpertPool::exl3_task(uint32_t i) {
+    const NativeFmt& f = *nfmt_;
+    const int H = (int) f.n_embd, F = (int) f.n_ff;
+    if (mode_ == 10 || mode_ == 12) {
+        const uint32_t it = exl3_items_[i];
+        const int e = (int) (it >> 8), t = (int) ((it >> 1) & 127), r = mode_ == 12 ? 2 : (int) (it & 1);
+        const exl3c::Mat m = exl3c::role(mjobs_[e].blob, r, H, F, f.exl3_gu, f.exl3_d);
+        const float* x = mode_ == 10 ? static_cast<const float*>(mjobs_[e].nact[t]) : split_multi_[(size_t) e].ff[t];
+        exl3c::prep(m, x, exl3_act(e, t, r));
+        return;
+    }
+    const int per = mode_ == 11 ? F / 128 : H / 128;
+    const int e = (int) i / per, b = (int) i % per, nt = mjobs_[e].nt;
+    const exl3c::Act* a0[MAXT];
+    const exl3c::Act* a1[MAXT];
+    float* y[MAXT];
+    if (mode_ == 11) {
+        const exl3c::Mat g = exl3c::role(mjobs_[e].blob, 0, H, F, f.exl3_gu, f.exl3_d);
+        const exl3c::Mat u = exl3c::role(mjobs_[e].blob, 1, H, F, f.exl3_gu, f.exl3_d);
+        for (int t = 0; t < nt; ++t) {
+            a0[t] = &exl3_act(e, t, 0);
+            a1[t] = &exl3_act(e, t, 1);
+            y[t] = split_multi_[(size_t) e].ff[t] + 128 * b;
+        }
+        exl3c::gu_block(g, u, a0, a1, nt, b, y);
+    } else {
+        const exl3c::Mat d = exl3c::role(mjobs_[e].blob, 2, H, F, f.exl3_gu, f.exl3_d);
+        for (int t = 0; t < nt; ++t) {
+            a0[t] = &exl3_act(e, t, 2);
+            y[t] = mjobs_[e].out[t] + 128 * b;
+        }
+        exl3c::block(d, a0, nt, b, y);
+    }
+}
+
+void ExpertPool::run_exl3(const NativeFmt& f, int nb) {
+    if (exl3_act_.empty()) exl3_act_.resize((size_t) kMaxSplitMulti * MAXT * 3);
+    nfmt_ = &f;
+    const auto a = std::chrono::steady_clock::now();
+    exl3_items_.clear();
+    for (int e = 0; e < nb; ++e)
+        for (int t = 0; t < mjobs_[e].nt; ++t)
+            for (int r = 0; r < 2; ++r) exl3_items_.push_back(((uint32_t) e << 8) | ((uint32_t) t << 1) | (uint32_t) r);
+    run_phase(10, (int) exl3_items_.size());
+    run_phase(11, nb * (int) (f.n_ff / 128));
+    const auto b = std::chrono::steady_clock::now();
+    exl3_items_.clear();
+    for (int e = 0; e < nb; ++e)
+        for (int t = 0; t < mjobs_[e].nt; ++t) exl3_items_.push_back(((uint32_t) e << 8) | ((uint32_t) t << 1));
+    run_phase(12, (int) exl3_items_.size());
+    const auto c = std::chrono::steady_clock::now();
+    run_phase(13, nb * (int) (f.n_embd / 128));
+    const auto d = std::chrono::steady_clock::now();
+    ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
+    ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();
+    ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
+}
+
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
     const auto t0 = std::chrono::steady_clock::now();
@@ -1364,6 +1424,10 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
+        if (f.exl3_gu) {   // EXL3: by 128-output blocks, each expert's inputs prepared once (exl3_cpu.hpp)
+            run_exl3(f, nb);
+            continue;
+        }
         mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, nb) : phase_tasks(mrows_);
         const auto a = std::chrono::steady_clock::now();

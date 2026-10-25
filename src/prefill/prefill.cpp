@@ -29,6 +29,7 @@
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/exl3_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -4983,7 +4984,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (nd > 0 && gx.n + nd > gu_exact_group()) gx_flush();
                             const int q = nd > 0 ? DQ + gx_nbuf++ : (int) (j % DQ);
                             pt.mark(kPfDequant, cs);
-                            if (lay.native) {
+                            if (lay.native && lay.fmt[(size_t) l].exl3_gu) {   // EXL3: the full weight, both rotations folded in
+                                const auto& f = lay.fmt[(size_t) l];
+                                strata::kernels::exl3_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                                     m.dq_gu[q], m.cs);
+                                strata::kernels::exl3_dequant_down_f16(f.d_type, blob_dev + f.down_off, f.n_ff, f.n_embd,
+                                                                       m.dq_d[q], m.cs);
+                            } else if (lay.native) {
                                 const auto& f = lay.fmt[(size_t) l];
                                 strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                    m.dq_gu[q], m.cs,
@@ -5153,7 +5160,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const bool defer = m.gu_exact_ok && N == 2560 && ne >= std::max(gx_min, kGuExactMinT) && ne <= kGuExactMaxT &&
                                                m.gemm.f16_on_rocblas(ne, 1280, N);
                             const int q = defer ? DQ + gx.n : (int) (j % DQ);
-                            if (lay.native) {
+                            if (lay.native && lay.fmt[(size_t) l].exl3_gu) {   // EXL3 (see the deferred path above)
+                                const auto& f = lay.fmt[(size_t) l];
+                                strata::kernels::exl3_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                                     m.dq_gu[q], m.cs);
+                                strata::kernels::exl3_dequant_down_f16(f.d_type, blob_dev + f.down_off, f.n_ff, f.n_embd,
+                                                                       m.dq_d[q], m.cs);
+                            } else if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
                                 strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,

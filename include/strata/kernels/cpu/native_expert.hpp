@@ -13,14 +13,16 @@
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest activation any native layer takes: 2560 values as Q8_K (10 x 292), or as F32 for an EXL3 layer
+/// (exl3_cpu.hpp: each expert rotates and quantizes it with its own scales).
+inline constexpr size_t kNativeActBytes = 10240;
+/// Bytes of the largest down activation (640 values as Q8_0: 20 x 34, Q8_K 3 x 292, or F32 for EXL3).
+inline constexpr size_t kNativeHBytes = 2560;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
-    int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down
+    int gu_type = -1, d_type = -1;      ///< ggml types of gate/up and of down (or EXL3 ids, exl3_expert.hpp)
+    int exl3_gu = 0, exl3_d = 0;        ///< EXL3 layers: 2 K of gate/up and of down (0: not EXL3); activations are F32
     int gu_act = -1, d_act = -1;        ///< their vec_dot_type (the activation formats)
     int64_t n_embd = 0, n_ff = 0;
     size_t gu_row = 0, d_row = 0;       ///< bytes per weight row

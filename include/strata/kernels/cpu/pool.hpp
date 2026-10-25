@@ -29,6 +29,7 @@
 
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/pool_plan.hpp"
 
 #include <atomic>
@@ -367,6 +368,14 @@ private:
     };
     const NativeFmt* nfmt_ = nullptr;
     std::vector<SplitBufMulti> split_multi_;
+    // EXL3 layers (exl3_cpu.hpp): run_split_multi_native's four phases - 10 prepare the gate/up inputs (one task per
+    // expert, token and role), 11 gate/up by 128-output block, 12 prepare the down inputs, 13 down by 128-output
+    // block.  Each expert's prepared inputs, [expert][token][gate, up, down], allocated on the first EXL3 layer.
+    std::vector<exl3c::Act> exl3_act_;
+    std::vector<uint32_t> exl3_items_;   // phases 10 / 12: (expert << 8) | (token << 1) | role
+    exl3c::Act& exl3_act(int e, int t, int r) { return exl3_act_[((size_t) e * MAXT + (size_t) t) * 3 + (size_t) r]; }
+    void run_exl3(const NativeFmt& f, int nb);
+    void exl3_task(uint32_t i);
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the
     // part the resident complement places on node k in step B), and each node's threads claim and count on their own
@@ -400,7 +409,7 @@ private:
     std::vector<int> slice_threads_;  // threads draining each slice (the host counted in its own)
     int64_t pub_ns_ = 0;              // the current mode-5/6 phase's publish time (host only)
     double slice_ms_[2] = {0.0, 0.0}; // accumulated per-slice drain time (host only)
-    bool numa_phase() const { return numa_n_ > 0 && mode_ >= 5; }
+    bool numa_phase() const { return numa_n_ > 0 && (mode_ == 5 || mode_ == 6); }   // not the EXL3 phases (10-13)
     /// The claim of `claim()` on slice `slice`'s head: `base + i`, or -1.
     int claim_slice(uint32_t epoch, int slice);
     std::atomic<uint32_t>& parked_of(int id) { return numa_n_ > 0 ? nsync_[(size_t) wslice_[(size_t) id]].parked : parked_; }
