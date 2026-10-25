@@ -265,6 +265,24 @@ def main() -> int:
                                 ("down", dn, full(*parts[2]).T)):
             rel = np.sqrt(((got - want) ** 2).sum() / (want ** 2).sum())
             print("dequant layer %d expert %d %s: rel RMS vs float64 %.2e (FP16 rounding is ~3e-4)" % (l, e, name, rel))
+        left = pathlib.Path(a.dequant_check[1] + ".left")
+        if left.exists():   # exl3_dequant_left_f16: diag(suh) H W' (the input rotation only), svh after the weights
+            raw = np.fromfile(left, np.float16)
+            g2 = raw[:2 * FF * H].reshape(2 * FF, H).astype(np.float64)
+            tail_gu = raw[2 * FF * H:2 * FF * H + 2 * FF]
+            d2 = raw[2 * FF * H + 2 * FF:2 * FF * H + 2 * FF + H * FF].reshape(H, FF).astype(np.float64)
+            tail_d = raw[2 * FF * H + 2 * FF + H * FF:]
+            def left_w(tr, suh, svh, k, n, K2):
+                w = decode(tr, k, n, K2).astype(np.float64) * float(A) + float(B)
+                return suh.astype(np.float64)[:, None] * (np.kron(np.eye(k // 128), Hm) @ w)
+            for name, got, want in (("gate", g2[0::2], left_w(*parts[0]).T), ("up", g2[1::2], left_w(*parts[1]).T),
+                                    ("down", d2, left_w(*parts[2]).T)):
+                rel = np.sqrt(((got - want) ** 2).sum() / (want ** 2).sum())
+                print("dequant-left layer %d expert %d %s: rel RMS vs float64 %.2e" % (l, e, name, rel))
+            ok = (np.array_equal(tail_gu[:FF].view(np.uint16), parts[0][2].view(np.uint16)) and
+                  np.array_equal(tail_gu[FF:].view(np.uint16), parts[1][2].view(np.uint16)) and
+                  np.array_equal(tail_d.view(np.uint16), parts[2][2].view(np.uint16)))
+            print("dequant-left svh tails:", "match" if ok else "DIFFER")
         return 0
     if a.fixture:
         recs = []

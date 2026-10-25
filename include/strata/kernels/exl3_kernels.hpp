@@ -35,3 +35,21 @@ void exl3_expert_grouped(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, 
                          float* out, void* stream);
 
 }  // namespace strata::kernels
+
+namespace strata::kernels {
+
+/// The prompt path's EXL3 weights with only the INPUT rotation folded in: W_in = diag(suh) H W' (an independent
+/// 128-point transform per column - a thread a column block, no shared memory), as FP16 in the engine's row layout
+/// (gate/up interleaved as exl3_dequant_gu_f16's), one launch for an expert's three matrices.  The output side
+/// (y = H(x W_in) * svh / 128) runs on the products: exl3_rotate_gu_out / exl3_rotate_d_out.  Each matrix's svh
+/// goes after its weights: dst_gu + 2 n_ff n_embd holds svh_gate [n_ff] then svh_up [n_ff], dst_d + n_embd n_ff
+/// holds svh_down [n_embd] (so the dequant buffers take kExl3GuTail / kExl3DTail more halves).
+void exl3_dequant_left_f16(int gu_type, int d_type, const void* blob, int64_t n_ff, int64_t n_embd, uint16_t* dst_gu,
+                           uint16_t* dst_d, void* stream);
+/// gate/up products [rows][2 n_ff] (interleaved: column 2 r gate r, 2 r + 1 up r), in place: each half's output
+/// rotation and svh / 128 (svh_gu: dst_gu's tail).
+void exl3_rotate_gu_out(float* gu, int64_t rows, int64_t n_ff, const uint16_t* svh_gu, void* stream);
+/// down products [rows][n_embd], in place: the output rotation and svh / 128 (svh_d: dst_d's tail).
+void exl3_rotate_d_out(float* dm, int64_t rows, int64_t n_embd, const uint16_t* svh_d, void* stream);
+
+}  // namespace strata::kernels

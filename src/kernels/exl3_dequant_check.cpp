@@ -53,5 +53,31 @@ int main(int argc, char** argv) {
     out.write(reinterpret_cast<const char*>(gu.data()), (std::streamsize) gu.size() * 2);
     out.write(reinterpret_cast<const char*>(d.data()), (std::streamsize) d.size() * 2);
     std::printf("layer %d expert %d: types %d/%d, wrote %s\n", L, E, gt, dt, argv[4]);
+    // the prompt path's dequantizer (input rotation only): its time per expert, launched back to back
+    {
+        uint16_t *lgu = nullptr, *ld = nullptr;
+        cudaMalloc(&lgu, ((size_t) 2 * FF * H + 2 * FF) * 2);
+        cudaMalloc(&ld, ((size_t) H * FF + H) * 2);
+        cudaStream_t st;
+        cudaStreamCreate(&st);
+        for (int i = 0; i < 20; ++i) strata::kernels::exl3_dequant_left_f16(gt, dt, b8, FF, H, lgu, ld, st);
+        cudaEvent_t a, b;
+        cudaEventCreate(&a); cudaEventCreate(&b);
+        cudaEventRecord(a, st);
+        const int reps = 500;
+        for (int i = 0; i < reps; ++i) strata::kernels::exl3_dequant_left_f16(gt, dt, b8, FF, H, lgu, ld, st);
+        cudaEventRecord(b, st);
+        cudaEventSynchronize(b);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, a, b);
+        std::printf("exl3_dequant_left_f16: %.1f us per expert (back to back)\n", 1000.0 * ms / reps);
+        // write the left-rotated weights after the full ones for tools/exl3_ref.py --dequant-check
+        std::vector<uint16_t> g2((size_t) 2 * FF * H + 2 * FF), d2((size_t) H * FF + H);
+        cudaMemcpy(g2.data(), lgu, g2.size() * 2, cudaMemcpyDeviceToHost);
+        cudaMemcpy(d2.data(), ld, d2.size() * 2, cudaMemcpyDeviceToHost);
+        std::ofstream o2(std::string(argv[4]) + ".left", std::ios::binary);
+        o2.write(reinterpret_cast<const char*>(g2.data()), (std::streamsize) g2.size() * 2);
+        o2.write(reinterpret_cast<const char*>(d2.data()), (std::streamsize) d2.size() * 2);
+    }
     return 0;
 }

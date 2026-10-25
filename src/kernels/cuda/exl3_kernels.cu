@@ -1,6 +1,7 @@
 // src/kernels/cuda/exl3_kernels.cu - EXL3 routed experts on the GPU (exl3_kernels.hpp).
 #include "strata/kernels/exl3_kernels.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -14,6 +15,20 @@ namespace {
 
 namespace ex = strata::kernels::exl3;
 
+// state * 0x83DCD12D (mod 2^32) for the state in the HIGH half of v (its low half: anything): one packed 16-bit multiply
+// gives (state * 0x83DC) << 16 (the low half multiplies 0), one 16 x 16 + 32 mad adds state * 0xD12D.  Two full-rate
+// instructions, where the compiler turns state * C into a quarter-rate v_mul_lo_u32.  Exact: integer arithmetic.
+__device__ __forceinline__ uint32_t mul1_hi(uint32_t v) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__)
+    uint32_t r, x;
+    asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(r) : "v"(v), "v"(0x83DC0000u));
+    asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(x) : "v"(v), "v"(0xD12Du), "v"(r));
+    return x;
+#else
+    return (v >> 16) * ex::kMul1;
+#endif
+}
+
 // the codebook index of tile step p (exl3_expert.hpp FORMAT): the 16-bit window ending at the step's end bit
 __device__ __forceinline__ int step_s(const uint32_t* w, int K2, int p) {
     const int words = 4 * K2, nbits = 32 * words;
@@ -25,9 +40,8 @@ __device__ __forceinline__ int step_s(const uint32_t* w, int K2, int p) {
     const int wi = start >> 5, off = start & 31;
     const int wj = wi + 1 == words ? 0 : wi + 1;
     const uint64_t v = ((uint64_t) w[wi] << 32) | w[wj];
-    const uint32_t state = (uint32_t) (v >> (48 - off)) & 0xFFFFu;
-    const uint32_t x = state * ex::kMul1;
-    return (int) ((x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + (x >> 24));
+    const uint32_t hi = (uint32_t) (v >> (32 - off));   // the window from bit `start`: the state in the high half
+    return (int) __builtin_amdgcn_sad_u8(mul1_hi(hi), 0u, 0u);
 }
 
 // LDS: a 128 x 128 block, element (r, c) at r * 128 + ((c + r) & 127) - the rotation keeps both the column passes
@@ -442,20 +456,6 @@ __global__ void __launch_bounds__(128) down_post_kernel(const unsigned long long
 // window then sits at a compile-time bit offset; its row is a function of the step alone and its column is one of the
 // lane's four (2 i, 2 i + 1, 2 i + 8, 2 i + 9).  The 8 tile rows' integer sums meet by three shuffle-adds (exact), and
 // the FP32 accumulation runs block by block as the spec says: bit for bit v1 / v2 / the CPU.
-// state * 0x83DCD12D (mod 2^32) for the state in the HIGH half of v (its low half: anything): one packed 16-bit multiply
-// gives (state * 0x83DC) << 16 (the low half multiplies 0), one 16 x 16 + 32 mad adds state * 0xD12D.  Two full-rate
-// instructions, where the compiler turns state * C into a quarter-rate v_mul_lo_u32.  Exact: integer arithmetic.
-__device__ __forceinline__ uint32_t mul1_hi(uint32_t v) {
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__GFX11__)
-    uint32_t r, x;
-    asm("v_pk_mul_lo_u16 %0, %1, %2" : "=v"(r) : "v"(v), "v"(0x83DC0000u));
-    asm("v_mad_u32_u16 %0, %1, %2, %3 op_sel:[1,0,0,0]" : "=v"(x) : "v"(v), "v"(0xD12Du), "v"(r));
-    return x;
-#else
-    return (v >> 16) * ex::kMul1;
-#endif
-}
-
 template <int K2>
 __global__ void __launch_bounds__(64) band_v3_kernel(const unsigned long long* grp_ptr, const int32_t* grp_start,
                                                      const int32_t* n_groups, int64_t cap_groups, uint8_t* scratch,
@@ -805,6 +805,239 @@ void exl3_expert_grouped(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, 
         std::fprintf(stderr, "exl3_expert_grouped: %s\n", cudaGetErrorString(err));
         std::exit(1);
     }
+}
+
+}  // namespace strata::kernels
+
+// ---- the prompt path: weights with the input rotation folded in, output rotations on the products ----------------
+namespace strata::kernels {
+namespace {
+
+// thread (role, j, c): column c of role's W' over inputs [128 j, 128 j + 128), rotated (H over the 128 inputs) and
+// scaled by suh -> 128 FP16 of dst row (row_mul c + row_add), from column 128 j.  grid (blocks, 3 roles).
+__global__ void __launch_bounds__(128) dequant_left_kernel(const uint8_t* blob, int H, int F, int gk2, int dk2,
+                                                           __half* dst_gu, __half* dst_d) {
+    const int role = (int) blockIdx.y;
+    const RoleView m = role_view(blob, role, H, F, gk2, dk2);
+    const int kb = m.k / 128;
+    const int t = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (t >= kb * m.n) return;
+    const int j = t % kb, c = t / kb;   // neighbouring threads: neighbouring 256-byte runs of one row
+    const int tn = c >> 4, cc = c & 15;
+    const size_t tile_bytes = 16u * (size_t) m.K2;
+    float v[128];
+#pragma unroll
+    for (int tkl = 0; tkl < 8; ++tkl) {
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(
+            m.trellis + ((size_t) (8 * j + tkl) * (size_t) (m.n / 16) + (size_t) tn) * tile_bytes);
+#pragma unroll
+        for (int r = 0; r < 16; ++r) v[16 * tkl + r] = ex::kA * (float) step_s(w, m.K2, step_of(r, cc)) + ex::kB;
+    }
+#pragma unroll
+    for (int h = 1; h < 128; h *= 2)
+#pragma unroll
+        for (int g = 0; g < 128; g += 2 * h)
+#pragma unroll
+            for (int i = g; i < g + h; ++i) {
+                const float a = v[i], b = v[i + h];
+                v[i] = a + b;
+                v[i + h] = a - b;
+            }
+    __half* dst = role == 2 ? dst_d + (size_t) c * (size_t) m.k : dst_gu + (size_t) (2 * c + role) * (size_t) m.k;
+    dst += 128 * j;
+#pragma unroll
+    for (int i = 0; i < 128; i += 8) {
+        __half hv[8];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) hv[k] = __float2half(v[i + k] * __half2float(m.suh[128 * j + i + k]));
+        *reinterpret_cast<uint4*>(dst + i) = *reinterpret_cast<const uint4*>(hv);
+    }
+    // the matrix's svh after its weights (role 0 / 1: the gate / up halves of dst_gu's tail)
+    if (j == 0) {
+        __half* tail = role == 2 ? dst_d + (size_t) H * (size_t) F : dst_gu + (size_t) 2 * F * H + (size_t) role * F;
+        tail[c] = m.svh[c];
+    }
+}
+
+// The same with 8 lanes a (column, block): lane sub of the group decodes tile row sub of the block (16 values of the
+// column), the Hadamard's strides 1..8 run in the lane and 16..64 across the group by xor shuffles; a wave = 4
+// (column, block) units, each group writing one 256-byte run.  grid (blocks, 3 roles), 128 threads.
+__global__ void __launch_bounds__(128) dequant_left2_kernel(const uint8_t* blob, int H, int F, int gk2, int dk2,
+                                                            __half* dst_gu, __half* dst_d) {
+    const int role = (int) blockIdx.y;
+    const RoleView m = role_view(blob, role, H, F, gk2, dk2);
+    const int kb = m.k / 128;
+    const int lane = (int) (threadIdx.x & 31), sub = lane & 7;
+    const int unit = (int) ((blockIdx.x * blockDim.x + threadIdx.x) >> 3);
+    if (unit >= kb * m.n) return;   // (whole 8-lane groups: the shuffles below stay inside live groups)
+    const int j = unit % kb, c = unit / kb;
+    const int tn = c >> 4, cc = c & 15;
+    const size_t tile_bytes = 16u * (size_t) m.K2;
+    const uint32_t* w = reinterpret_cast<const uint32_t*>(
+        m.trellis + ((size_t) (8 * j + sub) * (size_t) (m.n / 16) + (size_t) tn) * tile_bytes);
+    float v[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) v[r] = ex::kA * (float) step_s(w, m.K2, step_of(r, cc)) + ex::kB;
+#pragma unroll
+    for (int h = 1; h < 16; h *= 2)
+#pragma unroll
+        for (int g = 0; g < 16; g += 2 * h)
+#pragma unroll
+            for (int i = g; i < g + h; ++i) {
+                const float a = v[i], b = v[i + h];
+                v[i] = a + b;
+                v[i + h] = a - b;
+            }
+#pragma unroll
+    for (int msk = 1; msk < 8; msk <<= 1) {   // strides 16, 32, 64: lane sub ^ msk holds the partner rows
+        const bool upper = (sub & msk) != 0;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const float o = __shfl_xor_sync(0xffffffffu, v[k], msk);
+            v[k] = upper ? o - v[k] : v[k] + o;
+        }
+    }
+    __half* dst = role == 2 ? dst_d + (size_t) c * (size_t) m.k : dst_gu + (size_t) (2 * c + role) * (size_t) m.k;
+    dst += 128 * j + 16 * sub;
+    __half hv[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) hv[k] = __float2half(v[k] * __half2float(m.suh[128 * j + 16 * sub + k]));
+    reinterpret_cast<uint4*>(dst)[0] = reinterpret_cast<const uint4*>(hv)[0];
+    reinterpret_cast<uint4*>(dst)[1] = reinterpret_cast<const uint4*>(hv)[1];
+    if (j == 0 && sub == 0) {
+        __half* tail = role == 2 ? dst_d + (size_t) H * (size_t) F : dst_gu + (size_t) 2 * F * H + (size_t) role * F;
+        tail[c] = m.svh[c];
+    }
+}
+
+// v3 of the same: a block per (tile column tn, block j) of one role - its 8 tiles (128 inputs x 16 columns) and the
+// block's 128 suh staged in shared memory once; thread (cc = t >> 3, sub = t & 7) takes column 16 tn + cc, tile row
+// sub, as dequant_left2 does (16 values, strides 1..8 in the lane, 16..64 across the 8-lane group).
+// grid (n / 16 * k / 128 of the larger role, 3 roles), 128 threads.
+__global__ void __launch_bounds__(128) dequant_left3_kernel(const uint8_t* blob, int H, int F, int gk2, int dk2,
+                                                            __half* dst_gu, __half* dst_d) {
+    const int role = (int) blockIdx.y;
+    const RoleView m = role_view(blob, role, H, F, gk2, dk2);
+    const int kb = m.k / 128, tcols = m.n / 16;
+    const int bid = (int) blockIdx.x;
+    if (bid >= kb * tcols) return;   // a whole block: no barrier below is skipped by part of it
+    const int j = bid % kb, tn = bid / kb;
+    const int t = (int) threadIdx.x, cc = t >> 3, sub = t & 7;
+    const int tile_words = 4 * m.K2;
+    __shared__ uint32_t tw[8][32];   // the 8 tiles' words (K2 <= 8: at most 32 a tile)
+    __shared__ float su[128];
+    // stage: tile row r of the block is tile (8 j + r, tn); its words are contiguous
+    for (int i = t; i < 8 * tile_words; i += 128) {
+        const int r = i / tile_words, wv = i % tile_words;
+        tw[r][wv] = reinterpret_cast<const uint32_t*>(
+            m.trellis + ((size_t) (8 * j + r) * (size_t) tcols + (size_t) tn) * (16u * (size_t) m.K2))[wv];
+    }
+    su[t] = __half2float(m.suh[128 * j + t]);
+    __syncthreads();
+    float v[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) v[r] = ex::kA * (float) step_s(tw[sub], m.K2, step_of(r, cc)) + ex::kB;
+#pragma unroll
+    for (int h = 1; h < 16; h *= 2)
+#pragma unroll
+        for (int g = 0; g < 16; g += 2 * h)
+#pragma unroll
+            for (int i = g; i < g + h; ++i) {
+                const float a = v[i], b = v[i + h];
+                v[i] = a + b;
+                v[i + h] = a - b;
+            }
+#pragma unroll
+    for (int msk = 1; msk < 8; msk <<= 1) {
+        const bool upper = (sub & msk) != 0;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const float o = __shfl_xor_sync(0xffffffffu, v[k], msk);
+            v[k] = upper ? o - v[k] : v[k] + o;
+        }
+    }
+    const int c = 16 * tn + cc;
+    __half* dst = role == 2 ? dst_d + (size_t) c * (size_t) m.k : dst_gu + (size_t) (2 * c + role) * (size_t) m.k;
+    dst += 128 * j + 16 * sub;
+    __half hv[16];
+#pragma unroll
+    for (int k = 0; k < 16; ++k) hv[k] = __float2half(v[k] * su[16 * sub + k]);
+    reinterpret_cast<uint4*>(dst)[0] = reinterpret_cast<const uint4*>(hv)[0];
+    reinterpret_cast<uint4*>(dst)[1] = reinterpret_cast<const uint4*>(hv)[1];
+    if (j == 0 && sub == 0) {
+        __half* tail = role == 2 ? dst_d + (size_t) H * (size_t) F : dst_gu + (size_t) 2 * F * H + (size_t) role * F;
+        tail[c] = m.svh[c];
+    }
+}
+
+// wave (row, block b, half): the 128 values of one half (gate 0 / up 1) of row's block b, interleaved by 2
+__global__ void __launch_bounds__(128) rotate_gu_kernel(float* gu, int64_t rows, int F, const __half* svh_gu) {
+    const int64_t wave = (int64_t) blockIdx.x * 4 + (threadIdx.x >> 5);
+    const int per_row = 2 * (F / 128);
+    if (wave >= rows * per_row) return;
+    const int64_t row = wave / per_row;
+    const int rem = (int) (wave % per_row), b = rem >> 1, half = rem & 1;
+    const int lane = (int) (threadIdx.x & 31);
+    float* p = gu + (size_t) row * (size_t) (2 * F);
+    float v[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) v[k] = p[2 * (128 * b + 4 * lane + k) + half];
+    had128_wave(v);
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+        p[2 * (128 * b + 4 * lane + k) + half] = (v[k] * (1.0f / 128.0f)) * __half2float(svh_gu[half * F + 128 * b + 4 * lane + k]);
+}
+
+__global__ void __launch_bounds__(128) rotate_d_kernel(float* dm, int64_t rows, int H, const __half* svh_d) {
+    const int64_t wave = (int64_t) blockIdx.x * 4 + (threadIdx.x >> 5);
+    const int per_row = H / 128;
+    if (wave >= rows * per_row) return;
+    const int64_t row = wave / per_row;
+    const int b = (int) (wave % per_row), lane = (int) (threadIdx.x & 31);
+    float* p = dm + (size_t) row * (size_t) H + (size_t) (128 * b) + 4 * lane;
+    float4 x = *reinterpret_cast<float4*>(p);
+    float v[4] = {x.x, x.y, x.z, x.w};
+    had128_wave(v);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) v[k] = (v[k] * (1.0f / 128.0f)) * __half2float(svh_d[128 * b + 4 * lane + k]);
+    *reinterpret_cast<float4*>(p) = make_float4(v[0], v[1], v[2], v[3]);
+}
+
+void check_launch(const char* what) {
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+}  // namespace
+
+void exl3_dequant_left_f16(int gu_type, int d_type, const void* blob, int64_t n_ff, int64_t n_embd, uint16_t* dst_gu,
+                           uint16_t* dst_d, void* stream) {
+    const int gk2 = ex::k2_of(gu_type), dk2 = ex::k2_of(d_type);
+    if (!gk2 || !dk2 || n_embd % 128 || n_ff % 128) { std::fprintf(stderr, "exl3_dequant_left_f16: types %d/%d\n", gu_type, d_type); std::exit(1); }
+    const int blocks = (int) std::max(n_embd / 128 * (n_ff / 16), n_ff / 128 * (n_embd / 16));   // (tile column, block)
+    dequant_left3_kernel<<<dim3(blocks, 3), 128, 0, (cudaStream_t) stream>>>(
+        static_cast<const uint8_t*>(blob), (int) n_embd, (int) n_ff, gk2, dk2, reinterpret_cast<__half*>(dst_gu),
+        reinterpret_cast<__half*>(dst_d));
+    check_launch("exl3_dequant_left_f16");
+}
+
+void exl3_rotate_gu_out(float* gu, int64_t rows, int64_t n_ff, const uint16_t* svh_gu, void* stream) {
+    if (rows <= 0) return;
+    const int64_t waves = rows * 2 * (n_ff / 128);
+    rotate_gu_kernel<<<(unsigned) ((waves + 3) / 4), 128, 0, (cudaStream_t) stream>>>(gu, rows, (int) n_ff,
+                                                                                      reinterpret_cast<const __half*>(svh_gu));
+    check_launch("exl3_rotate_gu_out");
+}
+
+void exl3_rotate_d_out(float* dm, int64_t rows, int64_t n_embd, const uint16_t* svh_d, void* stream) {
+    if (rows <= 0) return;
+    const int64_t waves = rows * (n_embd / 128);
+    rotate_d_kernel<<<(unsigned) ((waves + 3) / 4), 128, 0, (cudaStream_t) stream>>>(dm, rows, (int) n_embd,
+                                                                                     reinterpret_cast<const __half*>(svh_d));
+    check_launch("exl3_rotate_d_out");
 }
 
 }  // namespace strata::kernels

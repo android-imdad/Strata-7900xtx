@@ -1196,6 +1196,24 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
+// EXL3 layers (exl3_kernels.hpp): their dequantized weights carry the input rotation only, so each product's output takes
+// the output rotation and svh here, in place - gate/up before SwiGLU, down before the combine.  The svh vectors sit in
+// the dequant buffer's tail (exl3_dequant_left_f16), so they travel with the weights the product used.
+bool exl3_layer(int64_t l) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    return lay.native && l >= 0 && (size_t) l < lay.fmt.size() && lay.fmt[(size_t) l].exl3_gu != 0;
+}
+void exl3_gu_out(int64_t l, float* gu, int64_t rows, const uint16_t* dq_gu, cudaStream_t st) {
+    if (!exl3_layer(l)) return;
+    const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
+    strata::kernels::exl3_rotate_gu_out(gu, rows, f.n_ff, dq_gu + (size_t) 2 * f.n_ff * f.n_embd, st);
+}
+void exl3_d_out(int64_t l, float* dm, int64_t rows, const uint16_t* dq_d, cudaStream_t st) {
+    if (!exl3_layer(l)) return;
+    const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
+    strata::kernels::exl3_rotate_d_out(dm, rows, f.n_embd, dq_d + (size_t) f.n_embd * f.n_ff, st);
+}
+
 struct MmqPlan {
     bool any = false, fallback = true;
     std::vector<char> layer;                   // per layer: MMQ
@@ -1786,7 +1804,8 @@ bool Prefill::carve(size_t T, void* alloc) {
         }
         if (base == nullptr) ok = false;
     }
-    for (int i = 0; i < DQ + gu_exact_group(); ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640, ok); }
+    // + the EXL3 svh tails (exl3_dequant_left_f16): 2 x 640 after the gate/up weights, 2560 after the down weights
+    for (int i = 0; i < DQ + gu_exact_group(); ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560 + 1280, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640 + 2560, ok); }
     m.gu_exact_ws = gu_exact_group() > 0 ? o.take<float>((size_t) 3 * gu_exact_group() * 64 * 1280, ok) : nullptr;
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
@@ -2521,7 +2540,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
-    for (int i = 0; i < DQ + gu_exact_group(); ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
+    for (int i = 0; i < DQ + gu_exact_group(); ++i) { o.take<uint16_t>(1280 * 2560 + 1280, ok); o.take<uint16_t>(2560 * 640 + 2560, ok); }
     if (gu_exact_group() > 0) o.take<float>((size_t) 3 * gu_exact_group() * 64 * 1280, ok);
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
@@ -4900,14 +4919,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 swiglu_interleaved(m.GU + o0[i] * 1280, m.Hh + o0[i] * 640, cnt[i], st);
                                 if (!m.gemm.f16_on(m.Hh + o0[i] * 640, m.dq_d[q[i]], m.Dm + o0[i] * N, cnt[i], N, 640, st))
                                     failed[nf++] = i;
+                                else
+                                    exl3_d_out(l, m.Dm + o0[i] * N, cnt[i], m.dq_d[q[i]], st);
                             }
                             for (int s = 0; s < ns; ++s) {
                                 cudaEventRecord(m.down_join[s], m.down_st[s]);
                                 cudaStreamWaitEvent(m.cs, m.down_join[s], 0);
                             }
-                            for (int f = 0; f < nf; ++f)   // a failed launch (nothing ran): the call on cs, after its SwiGLU
+                            for (int f = 0; f < nf; ++f) {   // a failed launch (nothing ran): the call on cs, after its SwiGLU
                                 m.gemm.f16(m.Hh + o0[failed[f]] * 640, m.dq_d[q[failed[f]]], m.Dm + o0[failed[f]] * N,
                                            cnt[failed[f]], N, 640);
+                                exl3_d_out(l, m.Dm + o0[failed[f]] * N, cnt[failed[f]], m.dq_d[q[failed[f]]], m.cs);
+                            }
                             return true;
                         };
                         auto gx_flush = [&]() {
@@ -4916,14 +4939,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             pt.mark(kPfGemmGU, cs);
                             if (!gu_exact_run(gx, m.gu_exact_ws, m.cs))   // (a failed launch: the same products, one call each)
                                 for (int i = 0; i < gx.n; ++i) m.gemm.f16(gx.x[i], gx.w[i], gx.y[i], gx.t[i], 1280, N);
+                            for (int i = 0; i < gx.n; ++i) exl3_gu_out(l, gx.y[i], gx.t[i], m.dq_gu[gx_q[i]], m.cs);
                             if (!dn_n.empty()) {
                                 if (dn_n.size() > (size_t) kGuExactMax ||
                                     !down_spread((int) dn_n.size(), dn_o0.data(), dn_n.data(), dn_q.data())) {
                                     for (int i = 0; i < gx.n; ++i)
                                         swiglu_interleaved(m.GU + gx_o0[i] * 1280, m.Hh + gx_o0[i] * 640, gx.t[i], m.cs);
                                     pt.mark(kPfGemmD, cs);
-                                    for (size_t i = 0; i < dn_n.size(); ++i)
+                                    for (size_t i = 0; i < dn_n.size(); ++i) {
                                         m.gemm.f16(m.Hh + dn_o0[i] * 640, m.dq_d[dn_q[i]], m.Dm + dn_o0[i] * N, dn_n[i], N, 640);
+                                        exl3_d_out(l, m.Dm + dn_o0[i] * N, dn_n[i], m.dq_d[dn_q[i]], m.cs);
+                                    }
                                 }
                                 dn_o0.clear(); dn_n.clear(); dn_q.clear();
                                 gx.n = 0;
@@ -4940,6 +4966,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                                 pt.mark(kPfGemmD, cs);
                                 m.gemm.f16(m.Hh + o0 * 640, m.dq_d[gx_q[i]], m.Dm + o0 * N, ne, N, 640);
+                                exl3_d_out(l, m.Dm + o0 * N, ne, m.dq_d[gx_q[i]], m.cs);
                             }
                             gx.n = 0;
                         };
@@ -4984,11 +5011,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (nd > 0 && gx.n + nd > gu_exact_group()) gx_flush();
                             const int q = nd > 0 ? DQ + gx_nbuf++ : (int) (j % DQ);
                             pt.mark(kPfDequant, cs);
-                            if (lay.native && lay.fmt[(size_t) l].exl3_gu) {   // EXL3: the full weight, both rotations folded in
+                            if (lay.native && lay.fmt[(size_t) l].exl3_gu) {   // EXL3: the input rotation folded in (the products take the output side: exl3_gu_out / exl3_d_out)
                                 const auto& f = lay.fmt[(size_t) l];
-                                strata::kernels::exl3_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                                     m.dq_gu[q], m.cs);
-                                strata::kernels::exl3_dequant_down_f16(f.d_type, blob_dev + f.down_off, f.n_ff, f.n_embd,
+                                strata::kernels::exl3_dequant_left_f16(f.gu_type, f.d_type, blob_dev, f.n_ff, f.n_embd, m.dq_gu[q],
                                                                        m.dq_d[q], m.cs);
                             } else if (lay.native) {
                                 const auto& f = lay.fmt[(size_t) l];
@@ -5017,9 +5042,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                                 pt.mark(kPfGemmGU, cs);
                                 m.gemm.f16(m.Xs + po[i] * N, m.dq_gu[q], m.GU + po[i] * 1280, pn[i], 1280, N);
+                                exl3_gu_out(l, m.GU + po[i] * 1280, pn[i], m.dq_gu[q], m.cs);
                                 swiglu_interleaved(m.GU + po[i] * 1280, m.Hh + po[i] * 640, pn[i], m.cs);
                                 pt.mark(kPfGemmD, cs);
                                 m.gemm.f16(m.Hh + po[i] * 640, m.dq_d[q], m.Dm + po[i] * N, pn[i], N, 640);
+                                exl3_d_out(l, m.Dm + po[i] * N, pn[i], m.dq_d[q], m.cs);
                             }
                             if (gx.n == gu_exact_group()) gx_flush();
                             return true;
@@ -5162,9 +5189,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int q = defer ? DQ + gx.n : (int) (j % DQ);
                             if (lay.native && lay.fmt[(size_t) l].exl3_gu) {   // EXL3 (see the deferred path above)
                                 const auto& f = lay.fmt[(size_t) l];
-                                strata::kernels::exl3_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                                     m.dq_gu[q], m.cs);
-                                strata::kernels::exl3_dequant_down_f16(f.d_type, blob_dev + f.down_off, f.n_ff, f.n_embd,
+                                strata::kernels::exl3_dequant_left_f16(f.gu_type, f.d_type, blob_dev, f.n_ff, f.n_embd, m.dq_gu[q],
                                                                        m.dq_d[q], m.cs);
                             } else if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
@@ -5190,6 +5215,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             pt.mark(kPfGemmGU, cs);
                             m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
+                            exl3_gu_out(l, m.GU + o0 * 1280, ne, m.dq_gu[q], m.cs);
                             swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
                             // APR, deliberately in place on the fp16 H: hadamard_rows_f16 reads fp16, runs the
                             // butterflies in fp32 and rounds once on the store, so against an fp32 rotation the only
@@ -5202,6 +5228,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (had_d) strata::kernels::hadamard_rows_f16(m.Hh + o0 * 640, ne, 640, had_block, had_sh, m.cs);
                             pt.mark(kPfGemmD, cs);
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+                            exl3_d_out(l, m.Dm + o0 * N, ne, m.dq_d[q], m.cs);
                             return true;
                         };
                         if (!stream_all) {
