@@ -361,7 +361,17 @@ inline int gu_exact_group() {
     return 0;
 #endif
 }
-constexpr int DQ_MAX = DQ + strata::prefill::kGuExactMax;
+// STRATA_PF_DQ_OVERLAP (default on; 0 = off): a GU_EXACT group's experts are dequantized on a side stream into one of
+// two buffer sets while the main stream runs the previous group's products from the other - the same kernels on the same
+// inputs, only their order across the two streams changes, so the same bits.  2 sets, or 1 (off / no GU_EXACT).
+inline int dq_sets() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_PF_DQ_OVERLAP");
+        return gu_exact_group() > 0 && !(v && v[0] == '0') ? 2 : 1;
+    }();
+    return n;
+}
+constexpr int DQ_MAX = DQ + 2 * strata::prefill::kGuExactMax;   // two GU_EXACT buffer sets (dq_sets)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
 // second GEMM (Y = W.hi + W.lo, ~16 mantissa bits): a router that picks its top 10 from the same x decode would.
@@ -918,6 +928,11 @@ struct Prefill::Impl {
     int down_ns = 0;
     cudaStream_t down_st[kDownStreamsMax] = {};
     cudaEvent_t down_fork = nullptr, down_join[kDownStreamsMax] = {};
+    // STRATA_PF_DQ_OVERLAP (dq_sets() == 2): the dequant stream, each set's "dequantized" and "free again" events, and the
+    // set the next deferred expert goes to
+    cudaStream_t dq_st = nullptr;
+    cudaEvent_t dq_ready[2] = {}, dq_free[2] = {};
+    int dq_set = 0;
     Gemm gemm;
     std::vector<void*> owned;
     // chunk buffers
@@ -1606,6 +1621,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (dok) m.down_ns = n;
         else cudaGetLastError();   // off (the streams made so far are destroyed with the rest)
     }
+    if (dq_sets() == 2 && m.dq_st == nullptr) {
+        bool qok = cudaStreamCreateWithFlags(&m.dq_st, cudaStreamNonBlocking) == cudaSuccess;
+        for (int i = 0; qok && i < 2; ++i)
+            qok = cudaEventCreateWithFlags(&m.dq_ready[i], cudaEventDisableTiming) == cudaSuccess &&
+                  cudaEventCreateWithFlags(&m.dq_free[i], cudaEventDisableTiming) == cudaSuccess;
+        if (!qok) { err = "prefill: the dequant stream (STRATA_PF_DQ_OVERLAP=0 runs without it)"; return false; }
+    }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
@@ -1805,7 +1827,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         if (base == nullptr) ok = false;
     }
     // + the EXL3 svh tails (exl3_dequant_left_f16): 2 x 640 after the gate/up weights, 2560 after the down weights
-    for (int i = 0; i < DQ + gu_exact_group(); ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560 + 1280, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640 + 2560, ok); }
+    for (int i = 0; i < DQ + dq_sets() * gu_exact_group(); ++i) { m.dq_gu[i] = o.take<uint16_t>(1280 * 2560 + 1280, ok); m.dq_d[i] = o.take<uint16_t>(2560 * 640 + 2560, ok); }
     m.gu_exact_ws = gu_exact_group() > 0 ? o.take<float>((size_t) 3 * gu_exact_group() * 64 * 1280, ok) : nullptr;
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
@@ -2540,7 +2562,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
-    for (int i = 0; i < DQ + gu_exact_group(); ++i) { o.take<uint16_t>(1280 * 2560 + 1280, ok); o.take<uint16_t>(2560 * 640 + 2560, ok); }
+    for (int i = 0; i < DQ + dq_sets() * gu_exact_group(); ++i) { o.take<uint16_t>(1280 * 2560 + 1280, ok); o.take<uint16_t>(2560 * 640 + 2560, ok); }
     if (gu_exact_group() > 0) o.take<float>((size_t) 3 * gu_exact_group() * 64 * 1280, ok);
     if (mmq_plan().any) {
         const MmqPlan& mp = mmq_plan();
@@ -4933,7 +4955,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             return true;
                         };
-                        auto gx_flush = [&]() {
+                        auto gx_flush_body = [&]() {
                             gx_nbuf = 0;
                             if (gx.n == 0) return;
                             pt.mark(kPfGemmGU, cs);
@@ -4969,6 +4991,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 exl3_d_out(l, m.Dm + o0 * N, ne, m.dq_d[gx_q[i]], m.cs);
                             }
                             gx.n = 0;
+                        };
+                        // STRATA_PF_DQ_OVERLAP: the group's products wait for its dequant (the side stream), and its buffer set is
+                        // free again once they ran - then the next group takes the other set
+                        auto gx_flush = [&]() {
+                            const bool side = dq_sets() == 2 && pf_piece() <= 0 && gx.n > 0;
+                            if (side) cudaStreamWaitEvent(m.cs, m.dq_ready[m.dq_set], 0);
+                            gx_flush_body();
+                            if (side) {
+                                cudaEventRecord(m.dq_free[m.dq_set], m.cs);
+                                m.dq_set ^= 1;
+                            }
                         };
                         // STRATA_PF_PIECE: an expert's rows are in token order, so a piece's rows are contiguous.  The
                         // expert is dequantized once and each piece's rows take exactly the calls a chunk of the piece's
@@ -5186,23 +5219,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             static const int64_t gx_min = [] { const char* v = std::getenv("STRATA_PF_GU_EXACT_MINT"); return v ? (int64_t) std::atoll(v) : kGuExactMinT; }();   // (debug)
                             const bool defer = m.gu_exact_ok && N == 2560 && ne >= std::max(gx_min, kGuExactMinT) && ne <= kGuExactMaxT &&
                                                m.gemm.f16_on_rocblas(ne, 1280, N);
-                            const int q = defer ? DQ + gx.n : (int) (j % DQ);
+                            const bool side = defer && dq_sets() == 2;   // STRATA_PF_DQ_OVERLAP: on the dequant stream
+                            const int q = defer ? DQ + (side ? m.dq_set : 0) * gu_exact_group() + gx.n : (int) (j % DQ);
+                            const cudaStream_t dqs = side ? m.dq_st : m.cs;
+                            if (side) {
+                                if (gx.n == 0) cudaStreamWaitEvent(dqs, m.dq_free[m.dq_set], 0);   // its set's last group ran
+                                if (slot >= 0) cudaStreamWaitEvent(dqs, m.copied[slot], 0);          // the blob has landed
+                            }
                             if (lay.native && lay.fmt[(size_t) l].exl3_gu) {   // EXL3 (see the deferred path above)
                                 const auto& f = lay.fmt[(size_t) l];
                                 strata::kernels::exl3_dequant_left_f16(f.gu_type, f.d_type, blob_dev, f.n_ff, f.n_embd, m.dq_gu[q],
-                                                                       m.dq_d[q], m.cs);
+                                                                       m.dq_d[q], dqs);
                             } else if (lay.native) {
                                 // plan v0.3 P6: a native pack's layer, dequantized by llama.cpp's own formulas
                                 const auto& f = lay.fmt[(size_t) l];
                                 strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
-                                                                   m.dq_gu[q], m.cs,
+                                                                   m.dq_gu[q], dqs,
                                                                    f.tail_off ? (const float*) (blob_dev + f.tail_off) : nullptr);
-                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs,
+                                strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], dqs,
                                                                 f.tail_off ? (const float*) (blob_dev + f.tail_off) + 2 : nullptr);
                             } else {
-                                blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
+                                blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], dqs);
                             }
-                            if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; m.used_bid[slot] = 0; }
+                            if (slot >= 0) { cudaEventRecord(m.used[slot], dqs); m.used_of[slot] = slot; m.used_bid[slot] = 0; }
+                            if (side) cudaEventRecord(m.dq_ready[m.dq_set], dqs);
                             if (defer) {
                                 gx.x[gx.n] = m.Xs + o0 * N;
                                 gx.w[gx.n] = m.dq_gu[q];
