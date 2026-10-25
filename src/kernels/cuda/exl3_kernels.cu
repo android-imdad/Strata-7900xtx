@@ -436,6 +436,122 @@ __global__ void __launch_bounds__(128) down_post_kernel(const unsigned long long
     out[(size_t) ent_dst[e] * (size_t) H + (size_t) c] = (y * (1.0f / 128.0f)) * __half2float(md.svh[c]);
 }
 
+// ---- v3: lanes own a quarter of a tile's bit stream (64 steps), a wave = the 8 tiles of one 128-input block ---------
+// Lane l: tile row 8 j + (l >> 2) of the block, quarter i = l & 3 of its tile (steps 64 i .. 64 i + 63, bits
+// [64 i K, 64 (i + 1) K) = words [K2 i, K2 (i + 1)), plus the word before for the windows that start earlier).  A step's
+// window then sits at a compile-time bit offset; its row is a function of the step alone and its column is one of the
+// lane's four (2 i, 2 i + 1, 2 i + 8, 2 i + 9).  The 8 tile rows' integer sums meet by three shuffle-adds (exact), and
+// the FP32 accumulation runs block by block as the spec says: bit for bit v1 / v2 / the CPU.
+template <int K2>
+__global__ void __launch_bounds__(64) band_v3_kernel(const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                                     const int32_t* n_groups, int64_t cap_groups, uint8_t* scratch,
+                                                     int H, int F, int gk2, int dk2, int role0, int units_per_role) {
+    constexpr int words = 4 * K2;
+    const int wave = (int) (blockIdx.x * 2 + (threadIdx.x >> 5)), lane = (int) (threadIdx.x & 31);
+    const int roles = role0 == 2 ? 1 : 2;
+    const int per_group = roles * units_per_role;
+    const int g = wave / per_group, rem = wave % per_group;
+    const int ng = (int) min<int64_t>(*n_groups, cap_groups);
+    if (g >= ng) return;
+    const int role = role0 + rem / units_per_role, tn = rem % units_per_role;
+    const int e0 = grp_start[g], nt = min(grp_start[g + 1] - e0, kV2MaxT);
+    const EntLay L(H, F);
+    const RoleView m = role_view(reinterpret_cast<const uint8_t*>(grp_ptr[g]), role, H, F, gk2, dk2);
+    const int qi = lane & 3, tr = lane >> 2;
+    const size_t tile_bytes = 16u * (size_t) K2;
+    const size_t qo = role == 0 ? L.qg : role == 1 ? L.qu : L.qd;
+    const size_t dof = role == 0 ? L.dg : role == 1 ? L.du : L.dd;
+    const size_t Qof = role == 0 ? L.Qg : role == 1 ? L.Qu : L.Qd;
+    float acc[kV2MaxT][4];
+#pragma unroll
+    for (int t = 0; t < kV2MaxT; ++t)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) acc[t][c] = 0.f;
+    const int nb = m.k / 128;
+    for (int j = 0; j < nb; ++j) {
+        const int tk = 8 * j + tr;
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(
+            m.trellis + ((size_t) tk * (size_t) (m.n / 16) + (size_t) tn) * tile_bytes);
+        uint32_t buf[K2 + 2];   // the word before, the K2 chunk words, and a zero (the last window's discarded low bits)
+        buf[0] = w[qi == 0 ? words - 1 : K2 * qi - 1];
+        buf[K2 + 1] = 0u;
+#pragma unroll
+        for (int k = 0; k < K2; ++k) buf[1 + k] = w[K2 * qi + k];
+        int sv[64];
+#pragma unroll
+        for (int u = 0; u < 64; ++u) {
+            constexpr int KA = K2 / 2;
+            const int endl = (K2 & 1) == 0 ? (u + 1) * KA : ((u & 1) == 0 ? (u >> 1) * K2 + KA : ((u + 1) >> 1) * K2);
+            const int b = endl - 16 + 32;            // bit index in buf (buf[0] = the word before the chunk)
+            const int a = b >> 5, o = b & 31;
+            const uint32_t v = o == 0 ? buf[a] : ((buf[a] << o) | (buf[a + 1] >> (32 - o)));
+            const uint32_t state = v >> 16;
+            const uint32_t x = __umul24(state, 0xD12Du) + (__umul24(state, 0x83DCu) << 16);   // state * 0x83DCD12D
+            sv[u] = (int) __builtin_amdgcn_sad_u8(x, 0u, 0u);                                 // its byte sum
+        }
+        // each token: its four columns' integer sums over this lane's tile, the 8 tile rows' sums met by three
+        // shuffle-adds (exact), then the block's FP32 step - one token's sums live at a time
+#pragma unroll
+        for (int t = 0; t < kV2MaxT; ++t) {
+            if (t < nt) {
+                const uint8_t* es = scratch + (size_t) (e0 + t) * L.bytes;
+                const int16_t* q = reinterpret_cast<const int16_t*>(es + qo) + 16 * tk;
+                const uint4 q0 = *reinterpret_cast<const uint4*>(q), q1 = *reinterpret_cast<const uint4*>(q + 8);
+                const uint32_t qw[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+                int32_t I[4] = {0, 0, 0, 0};
+#pragma unroll
+                for (int u = 0; u < 64; ++u) {
+                    const int r = ((u >> 3) & 3) * 2 + (u & 1) + 8 * ((u >> 1) & 1);
+                    const int cl = (u >> 5) + 2 * ((u >> 2) & 1);
+                    const int qr = (int32_t) (int16_t) (qw[r >> 1] >> (16 * (r & 1)));
+                    I[cl] += __mul24(qr, sv[u]);   // |q| <= 16383, s <= 1020: v_mad_i32_i24
+                }
+                const float d = reinterpret_cast<const float*>(es + dof)[j];
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    int32_t v = I[c];
+                    v += __shfl_xor_sync(0xffffffffu, v, 4);
+                    v += __shfl_xor_sync(0xffffffffu, v, 8);
+                    v += __shfl_xor_sync(0xffffffffu, v, 16);
+                    acc[t][c] = acc[t][c] + d * (float) v;
+                }
+            }
+        }
+    }
+    if (tr == 0) {
+        const size_t yo = role == 0 ? L.ypg : role == 1 ? L.ypu : L.ypd;
+#pragma unroll
+        for (int t = 0; t < kV2MaxT; ++t) {
+            if (t < nt) {
+                uint8_t* es = scratch + (size_t) (e0 + t) * L.bytes;
+                const float* d = reinterpret_cast<const float*>(es + dof);
+                const int32_t* Q = reinterpret_cast<const int32_t*>(es + Qof);
+                float qs = 0.f;
+                for (int jj = 0; jj < nb; ++jj) qs = qs + d[jj] * (float) Q[jj];   // as qs_kernel, left to right
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int col = 2 * qi + (c & 1) + 8 * (c >> 1);
+                    reinterpret_cast<float*>(es + yo)[16 * tn + col] = ex::kA * acc[t][c] + ex::kB * qs;
+                }
+            }
+        }
+    }
+}
+
+template <int K2>
+void launch_band_v3(int64_t cap_groups, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                    uint8_t* sc, int H, int F, int gk2, int dk2, int role0, cudaStream_t s) {
+    const int units = (role0 == 2 ? H : F) / 16;
+    const int waves = (int) cap_groups * (role0 == 2 ? 1 : 2) * units;
+    band_v3_kernel<K2><<<(waves + 1) / 2, 64, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, sc, H, F, gk2, dk2,
+                                                      role0, units);
+}
+
+bool v2_path() {
+    static const bool v2 = [] { const char* e = std::getenv("STRATA_EXL3_V2"); return e && e[0] == '1'; }();
+    return v2;
+}
+
 template <int K2>
 void launch_band(int64_t cap_groups, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                  uint8_t* sc, int H, int F, int gk2, int dk2, int role0, cudaStream_t s) {
@@ -447,6 +563,14 @@ void launch_band(int64_t cap_groups, const unsigned long long* grp_ptr, const in
 
 void band(int K2, int64_t cap_groups, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
           uint8_t* sc, int H, int F, int gk2, int dk2, int role0, cudaStream_t s) {
+    if (!v2_path()) {   // v3 (default)
+        switch (K2) {
+            case 5: launch_band_v3<5>(cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, role0, s); return;
+            case 6: launch_band_v3<6>(cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, role0, s); return;
+            case 7: launch_band_v3<7>(cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, role0, s); return;
+            default: break;   // the other widths: v2
+        }
+    }
     switch (K2) {
         case 4: launch_band<4>(cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, role0, s); break;
         case 5: launch_band<5>(cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, role0, s); break;

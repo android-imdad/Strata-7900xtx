@@ -190,7 +190,7 @@ int main(int argc, char** argv) {
         float ms = 0.f;
         cudaEventElapsedTime(&ms, a, b);
         std::printf("bench layer %d (types %d/%d): %d experts, %d entries: %.1f us per layer-window (%s)\n", bench_layer,
-                    f.gt, f.dt, NG, NE, 1000.0 * ms / reps, std::getenv("STRATA_EXL3_V1") ? "v1" : "v2");
+                    f.gt, f.dt, NG, NE, 1000.0 * ms / reps, std::getenv("STRATA_EXL3_V1") ? "v1" : std::getenv("STRATA_EXL3_V2") ? "v2" : "v3");
     }
     return fails ? 1 : 0;
 }
