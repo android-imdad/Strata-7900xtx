@@ -7,7 +7,8 @@ RX 7900 XTX (gfx1100) · Linux · ROCm · free and open source</p>
 [Strata](https://github.com/Niko1221/Strata) runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**,
 a 125-billion-parameter model, on one gaming PC. This fork tunes it for the RX 7900 XTX. Every speedup keeps the output
 **bit-identical** to upstream (the same log-probabilities and the same token at every position, so the same perplexity): faster, with nothing traded
-for quality. The one exception is an opt-in build, described under [Install](#install).
+for quality. The exceptions are opt-in: a parity build, described under [Install](#install), and the
+[EXL3 experts](#exl3-experts-smaller-faster-same-quality), a smaller quantization of the model's experts.
 
 Upstream Strata v0.2.4.1 against this fork (merged with v0.2.4.1), same PC, same day, alternating rounds, medians of 3
 (RX 7900 XTX 24 GB, Ryzen 7 9800X3D, 62 GiB RAM, Linux, ROCm 10.2, IQ3_S):
@@ -37,6 +38,25 @@ engine above, same day, 3 alternating rounds, medians: reads 4K prompts **+3.2%*
 (those rounds overlap; with the drafts held fixed, decode is **+4.8%**). Report:
 [bench/results/2026-10-24-...-speed](bench/results/2026-10-24-community-rx-7900-xtx-gfx1100-speed/).
 
+**Newest, opt-in: EXL3 experts.** The same model with its routed experts in turboderp's
+[EXL3](https://github.com/turboderp-org/exllamav3) 2.68-bit format instead of IQ3_S: the experts are **22% smaller**
+(39.5 GB instead of 50.3 GB), the quality is the same on chat and better on long code and documents (perplexity
+below), and it is faster everywhere. Same engine (`7c5de68d`) and settings, 3 alternating rounds, medians; every EXL3
+round beat every IQ3_S round in every row:
+
+| | IQ3_S experts | EXL3 2.68 experts | |
+| --- | ---: | ---: | ---: |
+| Writes answers (short chat) | 103.7 tokens/s | 115.8 tokens/s | **+12%** |
+| First token (short chat) | 0.85 s | 0.40 s | **-53%** |
+| Reads a 4K prompt | 1,450 tokens/s | 1,880 tokens/s | **+30%** |
+| Reads a 16K prompt | 1,937 tokens/s | 2,251 tokens/s | **+16%** |
+| Reads a 32K prompt | 2,011 tokens/s | 2,279 tokens/s | **+13%** |
+| Agent turn, first token | 2.80 s | 1.66 s | **-41%** |
+| Agent session, writes answers | 104.1 tokens/s | 113.5 tokens/s | **+9%** |
+
+Report: [bench/results/2026-10-25-...-exl3](bench/results/2026-10-25-community-rx-7900-xtx-gfx1100-exl3/). Sizes,
+perplexity and how to set it up: [EXL3 experts](#exl3-experts-smaller-faster-same-quality).
+
 Decode is also deterministic: the same question gives the same answer whatever the drafter does (and, with an opt-in
 build, whatever the expert placement).
 
@@ -61,10 +81,10 @@ identical output (+8% agent decode). `STRATA_SPEC_CUM=0.5` keeps drafts while th
 | | |
 | --- | --- |
 | **Graphics card** | AMD Radeon **RX 7900 XTX** (gfx1100, 24 GB). Other cards: use [upstream Strata](https://github.com/Niko1221/Strata). |
-| **RAM** | 64 GB for the IQ3_S model measured here (it was tested with 62 GiB usable). |
-| **Processor** | Any x86-64 with AVX2. The optional placement parity build (below) needs **AVX-512** (Zen 4 / Zen 5). |
+| **RAM** | 64 GB for the IQ3_S model measured here (it was tested with 62 GiB usable). The EXL3 experts take about 11 GB less. |
+| **Processor** | Any x86-64 with AVX2. The optional placement parity build (below) and the EXL3 experts need **AVX-512** (Zen 4 / Zen 5). |
 | **System** | Linux with ROCm. Measured with ROCm 10.2 (TheRock nightly 10.2.0a20260930). |
-| **Disk** | About 80 GB free, on an SSD. |
+| **Disk** | About 80 GB free, on an SSD. The EXL3 experts need 40 GB more, and 47 GB for the download while packing. |
 
 ## Install
 
@@ -143,6 +163,77 @@ strata generate: STRATA_CPU_PARITY: on (the CPU expert rows in the GPU's arithme
 
 If a check fails at start-up (another ROCm, another GPU), the feature turns itself off and the log says why. Every
 switch, how each one was checked and its limits: **[docs/RX7900XTX.md](docs/RX7900XTX.md)**.
+
+## EXL3 experts: smaller, faster, same quality
+
+An opt-in pack that swaps the model's **routed experts** (the 48 layers x 512 experts that hold most of its weights)
+from the GSQ-RCO IQ3_S GGUF for turboderp's [EXL3](https://github.com/turboderp-org/exllamav3) quant of the same model
+at 2.68 bits a weight ([`turboderp/Qwen3.8-Flash-Next-exl3`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3),
+revision `2.68bpw_h6_ng8`). Everything else (attention, the shared expert, the router, the n-gram table, the drafter)
+still comes from the IQ3_S GGUF, so the comparisons below measure the experts alone. The engine computes EXL3 experts
+with its own kernels on the GPU and the CPU, bit for bit the same on both
+([docs/RX7900XTX.md, part 8](docs/RX7900XTX.md#8-exl3-experts-the-routed-experts-in-exllamav3s-format-opt-in-pack)).
+The output differs from IQ3_S's, since the weights do.
+
+**Sizes**
+
+| Routed experts | IQ3_S | EXL3 2.68 |
+| --- | ---: | ---: |
+| Size of all 24,576 experts (each one 22% smaller in RAM and VRAM too) | 50.3 GB | **39.5 GB** (-22%) |
+| Bits a weight (scales included) | 3.33 | 2.61 |
+| Experts that fit in the VRAM cache (24 GB card, same settings) | 8,796 | 11,150 |
+
+The IQ3_S GGUF stays on disk for the rest of the model (54.8 GB + 28.8 GB, IQ3_S experts included), so the pack
+adds 39.5 GB of disk.
+
+**Quality: perplexity (lower is better)**
+
+| | Chat (turboderp's trace, 45,588 tokens) | Code and docs after long prompts (2,557 tokens) |
+| --- | ---: | ---: |
+| The uncompressed model (BF16, turboderp's chart) | 1.3847 | - |
+| Strata, IQ3_S experts | 1.4191 | 4.4465 |
+| Strata, **EXL3 2.68 experts** | 1.4218: **+0.19%** (95% CI -0.01% .. +0.39%) | 4.2122: **-5.3%** (95% CI -2.8% .. -7.7%) |
+| exllamav3 2.68, its own engine (for reference) | 1.4166 | 4.2176 |
+| exllamav3 3.18, its own engine (for reference) | 1.4026 | 4.2213 |
+
+On chat the two packs tie (the confidence interval includes zero); on long code and documentation EXL3 is clearly
+better, at 22% less memory. The percentages and their 95% confidence intervals compare the two packs token by token
+on the same text. The exllamav3 rows use exllamav3's own weights for the rest of the model too (attention at 6-7
+bits, an 8-bit n-gram table), so they are a reference point, not a like-for-like comparison.
+
+> **What perplexity means.** At every token of a real text, the model gives a probability to the token that actually
+> comes next. Perplexity is the exponential of the average of -log(that probability): roughly, how many equally
+> likely tokens the model is choosing between at each step. 1.0 would be a model that is always certain and always
+> right; 1.42 means it is usually close to sure and sometimes hesitates. Compression adds a little uncertainty, so
+> perplexity measures how much a quantized model loses against the original: on the chat trace the uncompressed model
+> scores 1.3847, IQ3_S is 2.5% above it and EXL3 2.68 2.7%. The two columns are different texts (chat is much easier to
+> predict than raw code and documentation), so compare rows within a column, not across columns. On the large chat
+> set, differences of a few tenths of a percent are noise; on the smaller code set, 1-2%. The confidence intervals say
+> which differences are real.
+
+**Speed:** the table at the top (same engine and settings, every round faster). Writing answers is +9-12%, reading
+prompts +13-30%, and first tokens arrive 40-50% sooner, mostly because the prompt path decodes the EXL3 experts inside
+its matrix kernels instead of first expanding each expert to 16-bit weights.
+
+**Set it up**
+
+```bash
+# 1. The EXL3 quant (46.6 GB; Strata does not use its n-gram table, so skip it)
+hf download turboderp/Qwen3.8-Flash-Next-exl3 --revision 2.68bpw_h6_ng8 --exclude ngram_embedding.safetensors \
+    --local-dir models/Qwen3.8-Flash-Next-exl3/2.68bpw_h6_ng8
+# 2. A pack with its experts, linking everything else from your IQ3_S pack (the directory your config's --pack
+#    points at; needs numpy; --check re-reads every part)
+python tools/exl3_pack.py --exl3 models/Qwen3.8-Flash-Next-exl3/2.68bpw_h6_ng8 --base <your IQ3_S pack> \
+    --out <new pack> --check
+```
+
+3. Use the parity build (`build-sexp`, see [Install](#install)) with `"STRATA_CPU_PARITY": "1"`, and in `args` point
+   `--pack` at the new pack. Keep `--native` and `--ple-gguf` on the IQ3_S GGUF. The log then says
+   `native pack: <new pack> experts (largest blob 1.86 MB)`. The download can be deleted after packing.
+
+Limits: the fast GPU paths are built for this model's shapes and for 2.5- and 3-bit layers (other EXL3 quants fall
+back to slower kernels); the CPU path needs AVX-512; the 3.18-bit quant (1.2% lower perplexity in exllamav3, more
+memory) is not packed or measured in Strata yet. Measured on one PC like everything here.
 
 ## More speed, if you accept a small change in output
 

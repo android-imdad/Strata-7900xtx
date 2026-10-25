@@ -2,9 +2,10 @@
 
 This branch (`rx7900xtx`) is upstream Strata plus speedups measured on one AMD Radeon RX 7900 XTX. Every change keeps
 the model's output **bit-identical**: reading the same texts, the engine with them gives the same log-probabilities
-and the same top token at every position as the engine without them, so the same perplexity. Nothing here trades quality for speed. The one exception is opt-in and built separately:
+and the same top token at every position as the engine without them, so the same perplexity. Nothing here trades quality for speed. The exceptions are opt-in:
 part 4 (`-DSTRATA_SWIGLU_SEXP` + `STRATA_CPU_PARITY=1`) shifts the output once against today's engine so that from then
-on it no longer depends on where the experts sit.
+on it no longer depends on where the experts sit, and part 8's EXL3 pack is another quantization of the experts
+(22% smaller, the same perplexity on chat, 5% lower on long code and docs, faster).
 
 Measured on: RX 7900 XTX 24 GB (gfx1100), Ryzen 7 9800X3D, 62 GiB RAM, Linux 7.2, ROCm 10.2 (TheRock nightly
 10.2.0a20260930), Qwen3.8-Flash-Next GSQ-RCO IQ3_S, 262,144-token context, no control vector.
@@ -319,6 +320,107 @@ follow timing, ~1-2% noise), so the fixed-draft measurement above is the better 
 Also tried: upstream's `STRATA_DEQUANT_WIDE=1` (8 values a thread for the dense Q4_K/Q5_K weights) is bit-exact here
 but 8-14% slower than the kernel it replaces, which already writes ~1.6 TB/s.
 
+### 8. EXL3 experts: the routed experts in exllamav3's format (opt-in pack)
+
+A different quantization of the same model's routed experts, so a different output: turboderp's
+[EXL3](https://github.com/turboderp-org/exllamav3) quant of Qwen3.8-Flash-Next at 2.68 bits a weight
+([`turboderp/Qwen3.8-Flash-Next-exl3`](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3), revision
+`2.68bpw_h6_ng8`). Its experts are trellis-coded (the `mul1` codebook: each weight is a 16-bit window of a bit stream,
+multiplied out to a byte sum), 2.5 bits a weight in 40 layers and 3 bits in layers 0-3 and 44-47, with per-channel scales
+and a 128-point Hadamard rotation on each side. `tools/exl3_pack.py` copies those tensors byte for byte into an
+`experts.bin` and links everything else from the IQ3_S pack: attention, GDN, the shared expert, the router, the
+n-gram table and the drafter still come from the IQ3_S GGUF. Only the routed experts differ, so the comparison below
+is the experts alone.
+
+| Routed experts (48 layers x 512) | IQ3_S pack (GSQ-RCO) | EXL3 2.68 pack |
+| --- | ---: | ---: |
+| Size | 50.3 GB | **39.5 GB** (-22%) |
+| Bits a weight (scales included) | 3.33 | **2.61** |
+| VRAM expert cache, same settings | ~8,800 slots | ~11,100 slots |
+
+The rest of the model is shared: the IQ3_S GGUF (54.8 GB + 28.8 GB, which also hold the IQ3_S experts) stays on
+disk, so the EXL3 pack adds 39.5 GB of disk, plus the 46.6 GB download while packing (without
+`ngram_embedding.safetensors`, which Strata does not use). In RAM and VRAM the experts take 22% less.
+
+**The same bits on the CPU and the GPU.** `include/strata/kernels/exl3_expert.hpp` is the arithmetic both compute:
+`x' = H(x * suh)` in FP32 with fixed butterflies, int8 per 128 inputs (round half away from zero), exact int32 sums
+`I = sum q * s` of the codebook byte sums, `acc = sum_j d_j I_j` left to right, `y' = A acc + B qs`, then `H`, `svh / 128`
+and the `sexp` SwiGLU of part 4. So, like part 4, the output does not depend on which device computes an expert, and a
+verify window gives every token the bits it gets alone. Checked: `tools/exl3_ref.py` (numpy) reproduces exllamav3's own
+weight reconstruction exactly; `exl3_cpu_parity` and `exl3_gpu_parity` match it bit for bit (144 of 144 checks:
+groups of 1-8 tokens, a PCIe pass's entry offsets, int8 and the Q15 option `STRATA_EXL3_ACT=15`); and kl.py with
+11,150 or 2,000 experts in VRAM (42% or 5% of decode's expert lookups on the GPU, the rest on the CPU) gives
+byte-identical log-probabilities at the same prompt chunk. (Compare at a fixed `--prefill` chunk: the automatic chunk
+shrinks with the cache - 32K at 11,150 slots, 2,816 tokens at 2,000 - and a different chunk is a different
+computation, for IQ3_S too. Part 5's `STRATA_PF_PIECE=8192` is exact only when the chunk is at least 8,192 tokens.)
+
+**Kernels.**
+
+- CPU: AVX-512 (VNNI, VBMI). A tile row's 16 states come from one `vpermi2b` of the byte-swapped tile, and `q * s` is
+  one `vpdpbusd` of the product's four bytes against q repeated: 0.14 ms an expert for one token.
+- GPU, decode (`STRATA_EXL3_V4=1`, default): one launch a layer. Input-transform blocks, then gate/up blocks (2 column
+  groups x 10 k-waves), then down blocks (4 x 5), handing off through per-group counters (a block only ever waits for
+  blocks dispatched before it). A lane decodes 32 consecutive trellis steps, which are two whole columns of a 16 x 16
+  tile, so its integer sums need no shuffles; each block's `d_j I_j` meet in LDS and are summed in order. 85 us for
+  a 32-expert, 40-entry layer window (the five-launch version: 117 us).
+- GPU, prompts (`STRATA_PF_EXL3_FUSED=1`, default): up to 64 experts a launch on FP16 WMMA. The activations are rotated
+  per expert (`x' = H(x * suh)`, FP16), each weight enters the tile as `1024 + s` (exact in FP16, the affine part
+  corrected once per row), and the output rotation, SwiGLU and down's input rotation run between the two products.
+  No dequantized weights and no per-expert GEMM calls: a 16K prompt's expert time fell from 6.2 s (dequantize + 2x
+  hipBLASLt per expert, which IQ3_S still uses) to 2.0 s. This is the prompt path's arithmetic, not decode's (FP16
+  activations): against the dequantize + GEMM path it differs by rounding (relative RMS 5e-4, `exl3_pf_check`);
+  `STRATA_PF_EXL3_FUSED=0` brings that path back. With `STRATA_PF_PIECE=8192` and `--prefill auto:32768` it gives the
+  8K-chunk run's log-probabilities byte for byte.
+
+**Quality**, perplexity (see the README for what it means), paired against IQ3_S on the same positions:
+
+| | Chat trace (45,588 positions) | Code and docs after long prompts (2,557 positions) |
+| --- | ---: | ---: |
+| BF16, the uncompressed model (turboderp's chart) | 1.3847 | - |
+| Strata, IQ3_S experts | 1.4191 | 4.4465 |
+| Strata, EXL3 2.68 experts | 1.4218 (+0.19%, CI -0.01..+0.39%) | **4.2122 (-5.3%, CI -2.8..-7.7%)** |
+| exllamav3 2.68 (its own engine and weights) | 1.4166 (-0.18%) | 4.2176 |
+| exllamav3 3.18 (its own engine and weights) | 1.4026 (-1.17%) | 4.2213 |
+
+The chat trace is turboderp's in-domain set; the second set is kl.py's texts (code and documentation read after 16K,
+16K and 64K prompts, text tokens only). On chat the two packs tie; on long code and docs EXL3 is clearly better. The
+0.37% that exllamav3's 2.68 keeps over Strata's on the chat trace is not the activations (Q15 activations changed
+nothing) - most likely its non-expert weights (6-7 bits) against the GGUF's.
+
+**Speed**, same engine and settings, `tools/strata_bench.py --long`, 3 alternating rounds, medians:
+
+| Test | IQ3_S experts | EXL3 2.68 experts | Change |
+| --- | ---: | ---: | ---: |
+| Short chat, writes answers | 103.7 tokens/s | 115.8 tokens/s | **+11.7%** |
+| Short chat, first token | 0.85 s | 0.40 s | **-53%** |
+| 4K prompt, reads | 1,450 tokens/s | 1,880 tokens/s | **+29.7%** |
+| 16K prompt, reads | 1,937 tokens/s | 2,251 tokens/s | **+16.2%** |
+| 32K prompt, reads | 2,011 tokens/s | 2,279 tokens/s | **+13.3%** |
+| Agent session, first token per turn | 2.80 s | 1.66 s | **-41%** |
+| Agent session, writes answers | 104.1 tokens/s | 113.5 tokens/s | **+9.0%** |
+
+Engine `7c5de68d` for both (the settings of parts 1-7), only `--pack` differs; every EXL3 round beat every IQ3_S
+round in every row. Report: [bench/results/2026-10-25-...-exl3](../bench/results/2026-10-25-community-rx-7900-xtx-gfx1100-exl3/).
+
+Also checked before the LAN server moved to it: the real server code for 5 soak rounds (chats plain and streamed, a
+6-turn conversation, 8K-32K prompts, an image, a tool call, parallel requests; no errors), and a hang that only the
+engine showed (counters inside the scratch moved with the window size) fixed and covered by a check.
+
+Notes from the kernel work (gfx1100, ROCm 10.2): write a decode step's instructions as asm groups of 8 states
+(multiply x8, multiply-add x8, byte sum x8), because the compiler, scheduling for registers, otherwise chains every
+step (159 -> 99 us); any scratch memory, even 152 bytes from a struct indexed at run time, slows wave launch badly
+(99 -> 89 us); flat loads count in `lgkmcnt`, so an LDS wait also waits for them (use global address space); a
+conditional prefetch becomes register copies that wait for the load; `v_dot4_i32_iu8` runs at half rate here.
+
+### 9. The prompt's dequantization beside the products (`STRATA_PF_DQ_OVERLAP=1`, default on)
+
+A GU_EXACT group's experts (part 2) are dequantized on their own stream into one of two buffer sets while the
+compute stream runs the previous group's products from the other. The same kernels on the same inputs: kl.py
+byte-identical with it on and off. With the LAN server's settings (8K chunks, no `STRATA_PF_DOWN_STREAMS`) fresh
+IQ3_S prompts read 7-11% faster (4K 1,174 -> 1,302, 16K 1,599 -> 1,712 tokens/s). With this page's settings (part 5's
+exact 32K chunks and part 7's down-product streams) it measured the same with and without (4K, 16K and 32K prompts,
+2 rounds), so it matters only without those. `STRATA_PF_DQ_OVERLAP=0` turns it off.
+
 ### Tried on this card and not kept
 
 - **Prefetching the next layer's experts.** Upstream's look-ahead (`RouterLookahead`: the next layer's router applied
@@ -366,6 +468,8 @@ and, for deterministic decode with faster drafting, set its `args` to `--spec 6 
 With the part 4 build, also `"STRATA_CPU_PARITY": "1"` in `env` and `--kv-resident 32768` in `args`.
 For part 5, `"STRATA_PF_PIECE": "8192"` in `env` and `--prefill auto:32768` in place of `--prefill auto` in `args`.
 For part 6, `"STRATA_SPEC_CUM": "0.5"` in `env` (keep `--spec-min-p 0.5`).
+For part 8, build an EXL3 pack (`tools/exl3_pack.py`, see the README) and point `--pack` at it, with the part 4 build
+and `STRATA_CPU_PARITY=1`.
 
 The log says whether it is on:
 
@@ -390,5 +494,7 @@ Why this is a fork rather than an upstream pull request, and thanks to Strata: s
 - Decode is unchanged by part 2; its gains are part 1's.
 - Part 5 reproduces 8K chunks (`STRATA_PF_PIECE` must equal the chunk the reference reads with: 8192 = `--prefill
   auto` here). Single GPU only: a layer split or peer GPU takes no checkpoints inside a chunk.
+- Part 8's fast GPU paths are built for this model's shapes (2560 x 640 experts) and 2.5- / 3-bit EXL3 layers; other
+  shapes or bit widths fall back to slower kernels. Its CPU path needs AVX-512 (VNNI, VBMI).
 - Part 4 needs AVX-512 (VNNI) on the CPU and was checked only for this model's formats. Its replica follows the GPU
   kernels' order as built here; a change to those kernels needs the `expert_replica` check again.
