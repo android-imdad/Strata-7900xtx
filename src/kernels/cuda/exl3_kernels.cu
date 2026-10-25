@@ -139,7 +139,7 @@ __device__ __forceinline__ int step_of(int r, int c) {
 
 // one entry's scratch: the prepared inputs of gate, up and down, and h
 struct EntLay {
-    size_t qg, qu, qd, dg, du, dd, Qg, Qu, Qd, qs, h, bytes;
+    size_t qg, qu, qd, dg, du, dd, Qg, Qu, Qd, qs, h, ypg, ypu, ypd, bytes;
     __host__ __device__ EntLay(int64_t H, int64_t F) {
         auto al = [](size_t v, size_t a) { return (v + a - 1) / a * a; };
         qg = 0; qu = (size_t) H; qd = 2 * (size_t) H;
@@ -147,7 +147,10 @@ struct EntLay {
         Qg = dd + 4 * (size_t) (F / 128); Qu = Qg + 4 * (size_t) (H / 128); Qd = Qu + 4 * (size_t) (H / 128);
         qs = Qd + 4 * (size_t) (F / 128);
         h = al(qs + 12, 16);
-        bytes = al(h + 4 * (size_t) F, 256);
+        ypg = h + 4 * (size_t) F;          // the v2 path's y' (before the output rotation) of gate, up and down
+        ypu = ypg + 4 * (size_t) F;
+        ypd = ypu + 4 * (size_t) F;
+        bytes = al(ypd + 4 * (size_t) H, 256);
     }
 };
 
@@ -311,6 +314,151 @@ __global__ void __launch_bounds__(128) down_kernel(const unsigned long long* grp
     out[(size_t) ent_dst[e] * (size_t) H + (size_t) (128 * b) + threadIdx.x] = y;
 }
 
+
+// ---- v2: one wave per (group, role, 16-column tile column), every token of the group at once -----------------------
+// Lane l owns column c = l & 15 of the tile column and rows 8 (l >> 4) .. + 7 of every tile; a tile's words sit one per
+// lane and the steps fetch theirs with shuffles.  The integer sums of a 128-input block are exact in any order (the two
+// halves meet by one integer shuffle-add), and the FP32 part runs block by block, left to right, as the spec says; the
+// output rotation runs after (post kernels), as in v1.  Bit for bit v1 and the CPU.
+constexpr int kV2MaxT = 8;
+
+template <int K2>
+__device__ __forceinline__ int step_end_t(int p) {
+    if constexpr ((K2 & 1) == 0) return (p + 1) * (K2 / 2);
+    else return (p & 1) == 0 ? (p >> 1) * (K2 | 1) + (K2 / 2) : ((p + 1) >> 1) * (K2 | 1);
+}
+
+template <int K2>
+__global__ void __launch_bounds__(128) band_v2_kernel(const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                                      const int32_t* n_groups, int64_t cap_groups, uint8_t* scratch,
+                                                      int H, int F, int gk2, int dk2, int role0, int units_per_role) {
+    constexpr int words = 4 * K2, nbits = 32 * words;
+    const int wave = (int) (blockIdx.x * 4 + (threadIdx.x >> 5)), lane = (int) (threadIdx.x & 31);
+    const int roles = role0 == 2 ? 1 : 2;
+    const int per_group = roles * units_per_role;
+    const int g = wave / per_group, rem = wave % per_group;
+    const int ng = (int) min<int64_t>(*n_groups, cap_groups);
+    if (g >= ng) return;
+    const int role = role0 + rem / units_per_role, tn = rem % units_per_role;
+    const int e0 = grp_start[g], nt = min(grp_start[g + 1] - e0, kV2MaxT);
+    const EntLay L(H, F);
+    const RoleView m = role_view(reinterpret_cast<const uint8_t*>(grp_ptr[g]), role, H, F, gk2, dk2);
+    const int c = lane & 15, h = lane >> 4;
+    const size_t tile_bytes = 16u * (size_t) K2;
+    const size_t qo = role == 0 ? L.qg : role == 1 ? L.qu : L.qd;
+    const size_t dof = role == 0 ? L.dg : role == 1 ? L.du : L.dd;
+    float acc[kV2MaxT];
+    for (int t = 0; t < kV2MaxT; ++t) acc[t] = 0.f;
+    // the 8 steps of this lane in a tile (rows 8 h + i, column c)
+    int sw[8], sh8[8];
+    for (int i = 0; i < 8; ++i) {
+        int start = step_end_t<K2>(step_of(8 * h + i, c)) - 16;
+        if (start < 0) start += nbits;
+        sw[i] = start >> 5;
+        sh8[i] = 48 - (start & 31);
+    }
+    for (int j = 0; j < m.k / 128; ++j) {
+        int32_t I[kV2MaxT];
+        for (int t = 0; t < kV2MaxT; ++t) I[t] = 0;
+        for (int tk = 8 * j; tk < 8 * j + 8; ++tk) {
+            const uint32_t* w = reinterpret_cast<const uint32_t*>(
+                m.trellis + ((size_t) tk * (size_t) (m.n / 16) + (size_t) tn) * tile_bytes);
+            const uint32_t mine = lane < words ? w[lane] : 0u;
+            int s[8];
+            for (int i = 0; i < 8; ++i) {
+                const uint32_t hi = __shfl_sync(0xffffffffu, mine, sw[i]);
+                const uint32_t lo = __shfl_sync(0xffffffffu, mine, sw[i] + 1 == words ? 0 : sw[i] + 1);
+                const uint32_t state = (uint32_t) ((((uint64_t) hi << 32) | lo) >> sh8[i]) & 0xFFFFu;
+                const uint32_t x = state * ex::kMul1;
+                s[i] = (int) ((x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + (x >> 24));
+            }
+            for (int t = 0; t < nt; ++t) {
+                const int8_t* q = reinterpret_cast<const int8_t*>(scratch + (size_t) (e0 + t) * L.bytes + qo) + 16 * tk + 8 * h;
+                const uint64_t q8 = *reinterpret_cast<const uint64_t*>(q);
+                int32_t a = I[t];
+                for (int i = 0; i < 8; ++i) a += (int32_t) (int8_t) (q8 >> (8 * i)) * s[i];
+                I[t] = a;
+            }
+        }
+        for (int t = 0; t < nt; ++t) {
+            const int32_t tot = I[t] + __shfl_xor_sync(0xffffffffu, I[t], 16);
+            const float d = reinterpret_cast<const float*>(scratch + (size_t) (e0 + t) * L.bytes + dof)[j];
+            acc[t] = acc[t] + d * (float) tot;
+        }
+    }
+    if (h == 0) {
+        const size_t yo = role == 0 ? L.ypg : role == 1 ? L.ypu : L.ypd;
+        for (int t = 0; t < nt; ++t) {
+            uint8_t* es = scratch + (size_t) (e0 + t) * L.bytes;
+            const float qs = reinterpret_cast<const float*>(es + L.qs)[role];
+            reinterpret_cast<float*>(es + yo)[16 * tn + c] = ex::kA * acc[t] + ex::kB * qs;
+        }
+    }
+}
+
+// grid (cap, n_ff / 128), 128 threads: gate and up block b: the output rotation, svh, SwiGLU -> h
+__global__ void __launch_bounds__(128) gu_post_kernel(const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                                      const int32_t* n_groups, int64_t cap_groups, const int32_t* ent_grp,
+                                                      uint8_t* scratch, int H, int F, int gk2, int dk2) {
+    const int e = blockIdx.x, b = blockIdx.y;
+    const int ng = (int) min<int64_t>(*n_groups, cap_groups);
+    if (e < grp_start[0] || e >= grp_start[ng]) return;
+    const EntLay L(H, F);
+    uint8_t* es = scratch + (size_t) e * L.bytes;
+    const uint8_t* blob = reinterpret_cast<const uint8_t*>(grp_ptr[ent_grp[e]]);
+    __shared__ float sh[128];
+    const int c = 128 * b + (int) threadIdx.x;
+    const RoleView mg = role_view(blob, 0, H, F, gk2, dk2), mu = role_view(blob, 1, H, F, gk2, dk2);
+    const float yg = had128_block(sh, reinterpret_cast<const float*>(es + L.ypg)[c]);
+    const float g = (yg * (1.0f / 128.0f)) * __half2float(mg.svh[c]);
+    __syncthreads();
+    const float yu = had128_block(sh, reinterpret_cast<const float*>(es + L.ypu)[c]);
+    const float u = (yu * (1.0f / 128.0f)) * __half2float(mu.svh[c]);
+    reinterpret_cast<float*>(es + L.h)[c] = (g / (1.0f + strata::kernels::sexp(-g))) * u;
+}
+
+// grid (cap, n_embd / 128), 128 threads: down block b: the output rotation and svh -> out row ent_dst[e]
+__global__ void __launch_bounds__(128) down_post_kernel(const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                                        const int32_t* n_groups, int64_t cap_groups, const int32_t* ent_grp,
+                                                        const int32_t* ent_dst, uint8_t* scratch, float* out, int H, int F,
+                                                        int gk2, int dk2) {
+    const int e = blockIdx.x, b = blockIdx.y;
+    const int ng = (int) min<int64_t>(*n_groups, cap_groups);
+    if (e < grp_start[0] || e >= grp_start[ng]) return;
+    const EntLay L(H, F);
+    uint8_t* es = scratch + (size_t) e * L.bytes;
+    const RoleView md = role_view(reinterpret_cast<const uint8_t*>(grp_ptr[ent_grp[e]]), 2, H, F, gk2, dk2);
+    __shared__ float sh[128];
+    const int c = 128 * b + (int) threadIdx.x;
+    const float y = had128_block(sh, reinterpret_cast<const float*>(es + L.ypd)[c]);
+    out[(size_t) ent_dst[e] * (size_t) H + (size_t) c] = (y * (1.0f / 128.0f)) * __half2float(md.svh[c]);
+}
+
+template <int K2>
+void launch_band(int64_t cap_groups, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                 uint8_t* sc, int H, int F, int gk2, int dk2, int role0, cudaStream_t s) {
+    const int units = (role0 == 2 ? H : F) / 16;
+    const int waves = (int) cap_groups * (role0 == 2 ? 1 : 2) * units;
+    band_v2_kernel<K2><<<(waves + 3) / 4, 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, sc, H, F, gk2, dk2,
+                                                       role0, units);
+}
+
+void band(int K2, int64_t cap_groups, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+          uint8_t* sc, int H, int F, int gk2, int dk2, int role0, cudaStream_t s) {
+    switch (K2) {
+        case 4: launch_band<4>(cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, role0, s); break;
+        case 5: launch_band<5>(cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, role0, s); break;
+        case 6: launch_band<6>(cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, role0, s); break;
+        case 7: launch_band<7>(cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, role0, s); break;
+        case 8: launch_band<8>(cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, role0, s); break;
+        default: std::fprintf(stderr, "exl3_expert_grouped: v2 has no K2 %d\n", K2); std::exit(1);
+    }
+}
+
+bool v1_path() {
+    static const bool v1 = [] { const char* e = std::getenv("STRATA_EXL3_V1"); return e && e[0] == '1'; }();
+    return v1;
+}
 }  // namespace
 
 size_t exl3_expert_scratch_bytes(int64_t cap, int64_t n_embd, int64_t n_ff) {
@@ -337,6 +485,22 @@ void exl3_expert_grouped(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, 
     prep_kernel<<<dim3(cap, 2, H / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_tok, ent_grp, x, sc,
                                                       H, F, gk2, dk2, 0);
     qs_kernel<<<dim3(cap, 2), 32, 0, s>>>(grp_start, n_groups, cap_groups, sc, H, F, 0);
+    if (!v1_path()) {   // v2 (default): the bands a wave each, then the output rotations
+        band(gk2, cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, 0, s);
+        gu_post_kernel<<<dim3(cap, F / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_grp, sc, H, F, gk2, dk2);
+        prep_kernel<<<dim3(cap, 1, F / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_tok, ent_grp, x, sc,
+                                                          H, F, gk2, dk2, 2);
+        qs_kernel<<<dim3(cap, 1), 32, 0, s>>>(grp_start, n_groups, cap_groups, sc, H, F, 2);
+        band(dk2, cap_groups, grp_ptr, grp_start, n_groups, sc, H, F, gk2, dk2, 2, s);
+        down_post_kernel<<<dim3(cap, H / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_grp, ent_dst, sc,
+                                                            out, H, F, gk2, dk2);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "exl3_expert_grouped: %s\n", cudaGetErrorString(err));
+            std::exit(1);
+        }
+        return;
+    }
     gu_kernel<<<dim3(cap, F / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_grp, sc, H, F, gk2, dk2);
     prep_kernel<<<dim3(cap, 1, F / 128), 128, 0, s>>>(grp_ptr, grp_start, n_groups, cap_groups, ent_tok, ent_grp, x, sc,
                                                       H, F, gk2, dk2, 2);

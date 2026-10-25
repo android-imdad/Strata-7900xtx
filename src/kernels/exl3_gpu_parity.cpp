@@ -2,6 +2,8 @@
 // The GPU's EXL3 verify groups (exl3_expert_grouped) bit for bit against tools/exl3_ref.py's fixture (the same one
 // exl3_cpu_parity checks the CPU against): each record's expert alone, then all records of one expert as one group
 // with the other records' inputs as extra tokens (a group of up to 8 entries), and two groups in one launch.
+// --bench [layer]: one layer-window's verify groups - 32 distinct experts, 40 entries (a 4-token window, top-10) - timed
+// over 200 launches back to back (us per call).
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -22,7 +24,9 @@ struct Rec { int layer, expert; std::vector<float> x, h, y; };
 }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: exl3_gpu_parity <pack> <fixture>\n"); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: exl3_gpu_parity <pack> <fixture> [--bench [layer]]\n"); return 2; }
+    const bool bench = argc > 3 && std::strcmp(argv[3], "--bench") == 0;
+    const int bench_layer = argc > 4 ? std::atoi(argv[4]) : 4;
     const std::string pack = argv[1];
     std::map<int, LayerFmt> lay;
     {
@@ -138,5 +142,50 @@ int main(int argc, char** argv) {
         std::printf("layer %2d expert %3d (types %d/%d): checked\n", key.first, key.second, f.gt, f.dt);
     }
     std::printf("%s: %d of %d checks bit-exact\n", fails ? "FAILED" : "OK", checks - fails, checks);
+    if (bench) {
+        const LayerFmt& f = lay.at(bench_layer);
+        const int NG = 32, NE = 40, CAPB = 80;
+        void* dblobs = nullptr;
+        cudaMalloc(&dblobs, (size_t) NG * f.blob);
+        for (int g = 0; g < NG; ++g) load(bench_layer, 13 * g + 1, (uint8_t*) dblobs + (size_t) g * f.blob);
+        std::vector<unsigned long long> ptr((size_t) NG);
+        for (int g = 0; g < NG; ++g) ptr[(size_t) g] = (unsigned long long) ((uint8_t*) dblobs + (size_t) g * f.blob);
+        std::vector<int32_t> hb(1 + (NG + 1) + 2 * CAPB, 0);
+        hb[0] = NG;
+        int e = 0;
+        for (int g = 0; g <= NG; ++g) { hb[(size_t) (1 + g)] = e; if (g < NG) e += g < NE - NG ? 2 : 1; }   // 8 experts take 2 tokens
+        for (int i = 0; i < NE; ++i) { hb[(size_t) (1 + NG + 1 + i)] = i; hb[(size_t) (1 + NG + 1 + CAPB + i)] = i % 4; }
+        int32_t* db = nullptr;
+        unsigned long long* dp = nullptr;
+        void* dsc = nullptr;
+        float *dx = nullptr, *dout = nullptr;
+        cudaMalloc(&db, hb.size() * 4); cudaMalloc(&dp, ptr.size() * 8);
+        cudaMalloc(&dsc, strata::kernels::exl3_expert_scratch_bytes(CAPB, H, F));
+        cudaMalloc(&dx, (size_t) 4 * H * 4); cudaMalloc(&dout, (size_t) CAPB * H * 4);
+        cudaMemcpy(db, hb.data(), hb.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dp, ptr.data(), ptr.size() * 8, cudaMemcpyHostToDevice);
+        std::vector<float> xs((size_t) 4 * H);
+        for (int t = 0; t < 4; ++t) std::memcpy(xs.data() + (size_t) t * H, recs[(size_t) (t % nrec)].x.data(), (size_t) H * 4);
+        cudaMemcpy(dx, xs.data(), xs.size() * 4, cudaMemcpyHostToDevice);
+        cudaStream_t st;
+        cudaStreamCreate(&st);
+        auto call = [&] {
+            strata::kernels::exl3_expert_grouped(f.gt, f.dt, H, F, dp, db + 1, db, db + 1 + NG + 1, db + 1 + NG + 1 + CAPB, CAPB,
+                                                 CAPB, dx, dsc, dout, st);
+        };
+        for (int i = 0; i < 20; ++i) call();
+        cudaStreamSynchronize(st);
+        cudaEvent_t a, b;
+        cudaEventCreate(&a); cudaEventCreate(&b);
+        const int reps = 200;
+        cudaEventRecord(a, st);
+        for (int i = 0; i < reps; ++i) call();
+        cudaEventRecord(b, st);
+        cudaEventSynchronize(b);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, a, b);
+        std::printf("bench layer %d (types %d/%d): %d experts, %d entries: %.1f us per layer-window (%s)\n", bench_layer,
+                    f.gt, f.dt, NG, NE, 1000.0 * ms / reps, std::getenv("STRATA_EXL3_V1") ? "v1" : "v2");
+    }
     return fails ? 1 : 0;
 }
