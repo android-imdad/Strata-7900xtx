@@ -189,8 +189,24 @@ int main(int argc, char** argv) {
         cudaEventSynchronize(b);
         float ms = 0.f;
         cudaEventElapsedTime(&ms, a, b);
-        std::printf("bench layer %d (types %d/%d): %d experts, %d entries: %.1f us per layer-window (%s)\n", bench_layer,
-                    f.gt, f.dt, NG, NE, 1000.0 * ms / reps, std::getenv("STRATA_EXL3_V1") ? "v1" : std::getenv("STRATA_EXL3_V2") ? "v2" : "v3");
+        // the engine replays the verify window as a captured graph: the same calls without the host's launch cost
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+        for (int i = 0; i < 20; ++i) call();
+        cudaStreamEndCapture(st, &graph);
+        cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+        cudaGraphLaunch(exec, st);
+        cudaStreamSynchronize(st);
+        cudaEventRecord(a, st);
+        for (int i = 0; i < 10; ++i) cudaGraphLaunch(exec, st);
+        cudaEventRecord(b, st);
+        cudaEventSynchronize(b);
+        float gms = 0.f;
+        cudaEventElapsedTime(&gms, a, b);
+        std::printf("bench layer %d (types %d/%d): %d experts, %d entries: %.1f us per layer-window launched, %.1f us in a "
+                    "graph (%s)\n", bench_layer, f.gt, f.dt, NG, NE, 1000.0 * ms / reps, 1000.0 * gms / 200,
+                    std::getenv("STRATA_EXL3_V1") ? "v1" : std::getenv("STRATA_EXL3_V2") ? "v2" : "v3");
     }
     return fails ? 1 : 0;
 }
