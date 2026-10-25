@@ -990,6 +990,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    // EXL3 packs: the fused expert kernels' wave counters (zeroed once, before any capture)
+    if (strata::kernels::cpu::expert_layout().native && !strata::kernels::cpu::expert_layout().fmt.empty() &&
+        strata::kernels::cpu::expert_layout().fmt[0].exl3_gu)
+        strata::kernels::exl3_expert_scratch_init(hit_scratch_, (int64_t) max_t_ * ss.k, g.n_embd, g.n_ff);
     {
         const int32_t one = 1;
         if (cudaMemcpy(one_, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -2193,7 +2197,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // EXL3 experts: each rotates and quantizes the F32 input itself (exl3_expert.hpp), bit for bit the CPU's
                 const auto& f = lay.fmt[(size_t) l];
                 strata::kernels::exl3_expert_grouped(f.gu_type, f.d_type, f.n_embd, f.n_ff, gp, gs, gn, p_dst, p_tok, cap,
-                                                     cap, mixed_ + (size_t) tb * N, hit_scratch_, dst_buf, gst);
+                                                     cap, mixed_ + (size_t) tb * N, hit_scratch_, dst_buf, gst, gy);
             } else if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];

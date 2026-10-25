@@ -24,15 +24,21 @@ namespace strata::kernels {
 
 /// Bytes of scratch exl3_expert_grouped needs for `cap` entries (n_embd, n_ff as the layer's).
 size_t exl3_expert_scratch_bytes(int64_t cap, int64_t n_embd, int64_t n_ff);
+/// Zero the scratch's counters (the fused band kernels count their waves modulo, so this runs once, after the
+/// scratch is allocated and before any graph capture).
+void exl3_expert_scratch_init(void* scratch, int64_t cap, int64_t n_embd, int64_t n_ff);
+/// (debug) STRATA_EXL3_V4DBG=128: the last v4 launch's per-block timeline as text (block kind g loc t0 t1 t2 t3)
+void exl3_v4_timeline_dump(const char* path, int nblocks);
 
 /// A verify window's EXL3 experts in exl3_expert.hpp's arithmetic - bit for bit the CPU's (exl3_cpu.hpp): group g's
 /// blob at grp_ptr[g]; its entries [grp_start[g], grp_start[g + 1]) (g < *n_groups, read on the device) take token
 /// ent_tok[e]'s F32 input (x + ent_tok[e] * n_embd) and write row ent_dst[e] of `out` (n_embd floats).  gu_type /
-/// d_type: the layer's EXL3 ids.
+/// d_type: the layer's EXL3 ids.  group_rows (0: cap_groups): the launch's groups side by side, each block striding
+/// over the rest (a PCIe pass: a few groups of cap).
 void exl3_expert_grouped(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const unsigned long long* grp_ptr,
                          const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                          const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const float* x, void* scratch,
-                         float* out, void* stream);
+                         float* out, void* stream, int64_t group_rows = 0);
 
 }  // namespace strata::kernels
 

@@ -70,6 +70,7 @@ int main(int argc, char** argv) {
     for (auto& [l, f] : lay) maxblob = std::max<size_t>(maxblob, f.blob);
     cudaMalloc(&d_blob[0], maxblob); cudaMalloc(&d_blob[1], maxblob);
     cudaMalloc(&d_scratch, strata::kernels::exl3_expert_scratch_bytes(CAP, H, F));
+    cudaMemset(d_scratch, 0, strata::kernels::exl3_expert_scratch_bytes(CAP, H, F));
     cudaMalloc(&d_x, (size_t) CAP * H * 4); cudaMalloc(&d_out, (size_t) CAP * H * 4);
     cudaMalloc(&d_i32, 4 * 64); cudaMalloc(&d_ptr, 8 * 4);
     auto load = [&](int l, int e, void* dst) {
@@ -80,7 +81,7 @@ int main(int argc, char** argv) {
         cudaMemcpy(dst, b.data(), f.blob, cudaMemcpyHostToDevice);
     };
     // groups: list of (blob slot, record indices as entries); token t = entry index, dst row = entry index
-    int offset = 0;
+    int offset = 0, rows = 0;   // rows: the launch's group rows (0: all; 1: one block row striding over the groups)
     auto run = [&](const LayerFmt& f, const std::vector<std::vector<int>>& groups, std::vector<std::vector<float>>& ys) {
         const int base = offset;   // entries [base, base + n): a PCIe pass's follow the VRAM pass's
         std::vector<int32_t> start{base}, ent;
@@ -101,7 +102,7 @@ int main(int argc, char** argv) {
         cudaMemcpy(d_x, xs.data(), xs.size() * 4, cudaMemcpyHostToDevice);
         cudaMemset(d_out, 0xFF, (size_t) CAP * H * 4);
         strata::kernels::exl3_expert_grouped(f.gt, f.dt, H, F, d_ptr, d_i32 + 1, d_i32, d_i32 + 8, d_i32 + 32, 4, CAP,
-                                             d_x, d_scratch, d_out, nullptr);
+                                             d_x, d_scratch, d_out, nullptr, rows);
         std::vector<float> out((size_t) ne * H);
         cudaMemcpy(out.data(), d_out, out.size() * 4, cudaMemcpyDeviceToHost);
         ys.assign((size_t) ne, {});
@@ -142,6 +143,13 @@ int main(int argc, char** argv) {
             run(f, {idx, pidx}, ys);
             for (size_t i = 0; i < idx.size(); ++i) cmp(ys[i], idx[i], "two groups");
             for (size_t i = 0; i < pidx.size(); ++i) cmp(ys[idx.size() + i], pidx[i], "two groups (2nd)");
+            rows = 1;   // the same two groups by one block row (each block takes both, one after the other)
+            offset = 3;
+            run(f, {idx, pidx}, ys);
+            rows = 0;
+            offset = 0;
+            for (size_t i = 0; i < idx.size(); ++i) cmp(ys[i], idx[i], "two groups, one row, at 3");
+            for (size_t i = 0; i < pidx.size(); ++i) cmp(ys[idx.size() + i], pidx[i], "two groups, one row, at 3 (2nd)");
         }
         prev = key;
         std::printf("layer %2d expert %3d (types %d/%d): checked\n", key.first, key.second, f.gt, f.dt);
@@ -166,6 +174,7 @@ int main(int argc, char** argv) {
         float *dx = nullptr, *dout = nullptr;
         cudaMalloc(&db, hb.size() * 4); cudaMalloc(&dp, ptr.size() * 8);
         cudaMalloc(&dsc, strata::kernels::exl3_expert_scratch_bytes(CAPB, H, F));
+        cudaMemset(dsc, 0, strata::kernels::exl3_expert_scratch_bytes(CAPB, H, F));
         cudaMalloc(&dx, (size_t) 4 * H * 4); cudaMalloc(&dout, (size_t) CAPB * H * 4);
         cudaMemcpy(db, hb.data(), hb.size() * 4, cudaMemcpyHostToDevice);
         cudaMemcpy(dp, ptr.data(), ptr.size() * 8, cudaMemcpyHostToDevice);
@@ -204,6 +213,12 @@ int main(int argc, char** argv) {
         cudaEventSynchronize(b);
         float gms = 0.f;
         cudaEventElapsedTime(&gms, a, b);
+        if (const char* tl = std::getenv("STRATA_EXL3_TL")) {   // (debug) one more launch, its v4 timeline
+            cudaDeviceSynchronize();
+            if (std::getenv("STRATA_EXL3_TL_B2B")) call();   // (after another: their boundary)
+            call();
+            strata::kernels::exl3_v4_timeline_dump(tl, CAPB * 22);
+        }
         std::printf("bench layer %d (types %d/%d): %d experts, %d entries: %.1f us per layer-window launched, %.1f us in a "
                     "graph (%s)\n", bench_layer, f.gt, f.dt, NG, NE, 1000.0 * ms / reps, 1000.0 * gms / 200,
                     std::getenv("STRATA_EXL3_V1") ? "v1" : std::getenv("STRATA_EXL3_V2") ? "v2" : "v3");
