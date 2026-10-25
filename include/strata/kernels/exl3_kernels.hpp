@@ -73,6 +73,7 @@ struct Exl3PfGroup {
     int32_t cnt[16];   // its rows
     int32_t rel[17];   // the group's rows: expert e's at [rel[e], rel[e + 1]) of the scratch
     int32_t mc0[17];   // 64-row chunks: expert e's at [mc0[e], mc0[e + 1])
+    int32_t mc1[17];   // 128-row chunks (the gate/up product's)
     int32_t n;
 };
 /// Whether exl3_pf_group takes this layer (the shapes and K it is built for).

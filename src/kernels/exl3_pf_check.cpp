@@ -43,9 +43,42 @@ __global__ void ref_swiglu(const float* gu, __half* h, int rows, int nff) {
     const float v = g / (1.0f + __expf(-g)) * u;
     h[i] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
 }
+typedef _Float16 h16v __attribute__((ext_vector_type(16)));
+typedef float f8v __attribute__((ext_vector_type(8)));
+// (--wmma-peak) register-only WMMAs: 8 independent accumulators a wave
+__global__ void __launch_bounds__(256) wmma_peak(float* out, int iters) {
+    h16v a, b;
+    for (int i = 0; i < 16; ++i) { a[i] = (_Float16) (threadIdx.x + i); b[i] = (_Float16) (i - 3); }
+    f8v c[8];
+    for (int j = 0; j < 8; ++j) for (int i = 0; i < 8; ++i) c[j][i] = 0.f;
+    for (int it = 0; it < iters; ++it)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) c[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c[j]);
+    float s = 0.f;
+    for (int j = 0; j < 8; ++j) for (int i = 0; i < 8; ++i) s += c[j][i];
+    if (s == 12345.f) out[0] = s;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "--wmma-peak") == 0) {
+        float* d;
+        cudaMalloc(&d, 4);
+        const int iters = 4096, blocks = 96 * 2 * 8;
+        wmma_peak<<<blocks, 256>>>(d, 16);
+        cudaDeviceSynchronize();
+        cudaEvent_t t0, t1;
+        cudaEventCreate(&t0); cudaEventCreate(&t1);
+        cudaEventRecord(t0);
+        wmma_peak<<<blocks, 256>>>(d, iters);
+        cudaEventRecord(t1);
+        cudaEventSynchronize(t1);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, t0, t1);
+        const double flop = 2.0 * 16 * 16 * 16 * 8.0 * iters * (blocks * 8.0);
+        std::printf("wmma f32 16x16x16 f16: %.1f TFLOPS (%d blocks x 8 waves, 8 accumulators)\n", flop / (ms * 1e-3) / 1e12, blocks);
+        return 0;
+    }
     if (argc < 3) { std::fprintf(stderr, "usage: exl3_pf_check <pack> <fixture> [layer] [--bench]\n"); return 2; }
     const std::string pack = argv[1];
     const int layer = argc > 3 && argv[3][0] != '-' ? std::atoi(argv[3]) : 4;

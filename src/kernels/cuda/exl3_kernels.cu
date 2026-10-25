@@ -1346,9 +1346,9 @@ __device__ __forceinline__ int expert_of_rel(const Exl3PfGroup& g, int r) {
     while (e + 1 < g.n && g.rel[e + 1] <= r) ++e;
     return e;
 }
-__device__ __forceinline__ int expert_of_mc(const Exl3PfGroup& g, int c) {
+__device__ __forceinline__ int expert_of_mc(const Exl3PfGroup& g, int c, const int32_t* mc) {
     int e = 0;
-    while (e + 1 < g.n && g.mc0[e + 1] <= c) ++e;
+    while (e + 1 < g.n && mc[e + 1] <= c) ++e;
     return e;
 }
 
@@ -1450,27 +1450,31 @@ __device__ __forceinline__ h16 load_a(const __half* p) {   // 16 consecutive hal
 #ifndef STRATA_PF_WPE_D
 #define STRATA_PF_WPE_D 1
 #endif
-template <int K2>
+template <int K2, int MS>   // MS: 16-row tiles a block (its rows: 16 MS; chunks g.mc0 for 4, g.mc1 for 8)
 __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(STRATA_PF_WPE_GU))) gemm_gu_kernel(Exl3PfGroup g, int gk2, int dk2, const float* __restrict__ Dm,
                                                       const float* __restrict__ rs, float* GU) {
+    constexpr int RB = 16 * MS;
+    const int32_t* mc = MS == 8 ? g.mc1 : g.mc0;
     const int lane = (int) (threadIdx.x & 31), wave = (int) (threadIdx.x >> 5);
     const int ob = (int) blockIdx.x % (F / 128), mcg = (int) blockIdx.x / (F / 128);
-    if (mcg >= g.mc0[g.n]) return;
-    const int e = expert_of_mc(g, mcg), row0 = MC * (mcg - g.mc0[e]), nrow = min(MC, g.cnt[e] - row0);
+    if (mcg >= mc[g.n]) return;
+    const int e = expert_of_mc(g, mcg, mc), row0 = RB * (mcg - mc[e]), nrow = min(RB, g.cnt[e] - row0);
     const int role = wave >> 2, tt = lane >> 4, nms = (nrow + 15) / 16;
     const int tn = 8 * ob + 2 * (wave & 3) + tt;
     const RoleView m = role_view(g.blob[e], role, H, F, gk2, dk2);
     const size_t kstep = (size_t) (F / 16) * (size_t) (4 * K2);
     const uint32_t* wp = reinterpret_cast<const uint32_t*>(m.trellis) + (size_t) tn * (4 * K2) + (size_t) ((K2 * ((lane & 15) & 7)) / 2);
-    const __half* xa[4];
+    // the lane's A rows as offsets in halves from the rotated inputs' base (Dm as FP16: 2 H halves a row)
+    const __half* abase = reinterpret_cast<const __half*>(Dm) + (size_t) role * H;
+    uint32_t xo[MS];
 #pragma unroll
-    for (int ms = 0; ms < 4; ++ms) {
+    for (int ms = 0; ms < MS; ++ms) {
         const int rr = min(row0 + 16 * ms + (lane & 15), g.cnt[e] - 1);
-        xa[ms] = reinterpret_cast<const __half*>(Dm + ((size_t) g.off[e] + (size_t) rr) * H) + (size_t) role * H;
+        xo[ms] = (uint32_t) (((size_t) g.off[e] + (size_t) rr) * (2 * H));
     }
-    f8 acc[4][2];
+    f8 acc[MS][2];
 #pragma unroll
-    for (int ms = 0; ms < 4; ++ms) acc[ms][0] = acc[ms][1] = f8{0, 0, 0, 0, 0, 0, 0, 0};
+    for (int ms = 0; ms < MS; ++ms) acc[ms][0] = acc[ms][1] = f8{0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t w0[3], w1[3];
     v4::load3(wp, w0);
     v4::load3(wp + kstep, w1);
@@ -1492,9 +1496,9 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(STRATA
         const h16 BA = __builtin_bit_cast(h16, u8v{ba[0], ba[1], ba[2], ba[3], ba[4], ba[5], ba[6], ba[7]});
         const h16 BB = __builtin_bit_cast(h16, u8v{bb[0], bb[1], bb[2], bb[3], bb[4], bb[5], bb[6], bb[7]});
 #pragma unroll
-        for (int ms = 0; ms < 4; ++ms) {
+        for (int ms = 0; ms < MS; ++ms) {
             if (ms >= nms) break;   // the chunk's rows end: no products for empty 16-row tiles (wave-uniform)
-            const h16 A = STRATA_PF_EXP == 2 ? BA : load_a(xa[ms] + 16 * kt);   // (exp 2: no A loads)
+            const h16 A = STRATA_PF_EXP == 2 ? BA : load_a(abase + xo[ms] + 16 * kt);   // (exp 2: no A loads)
             acc[ms][0] = wmma(A, BA, acc[ms][0]);
             acc[ms][1] = wmma(A, BB, acc[ms][1]);
         }
@@ -1506,7 +1510,7 @@ __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(STRATA
     }
     // C lane l: rows 2 i + l / 16, column l % 16 of each 16 x 16
 #pragma unroll
-    for (int ms = 0; ms < 4; ++ms)
+    for (int ms = 0; ms < MS; ++ms)
 #pragma unroll
         for (int t = 0; t < 2; ++t)
 #pragma unroll
@@ -1564,11 +1568,11 @@ __global__ void __launch_bounds__(256) gu_post_kernel(Exl3PfGroup g, const float
 template <int K2>
 __global__ void __launch_bounds__(128) __attribute__((amdgpu_waves_per_eu(STRATA_PF_WPE_D))) gemm_d_kernel(Exl3PfGroup g, int gk2, int dk2, const __half* __restrict__ Hh,
                                                      const float* __restrict__ rs, float* Dm) {
-    __shared__ float ys[MC][128 + 1];
+    __shared__ float ys[MC / 2][128 + 1];   // the output side in two passes of 32 rows (LDS: occupancy)
     const int lane = (int) (threadIdx.x & 31), wave = (int) (threadIdx.x >> 5);
     const int ob = (int) blockIdx.x % (H / 128), mcg = (int) blockIdx.x / (H / 128);
     if (mcg >= g.mc0[g.n]) return;
-    const int e = expert_of_mc(g, mcg), row0 = MC * (mcg - g.mc0[e]), nrow = min(MC, g.cnt[e] - row0);
+    const int e = expert_of_mc(g, mcg, g.mc0), row0 = MC * (mcg - g.mc0[e]), nrow = min(MC, g.cnt[e] - row0);
     const int tt = lane >> 4, tn = 8 * ob + 2 * wave + tt, nms = (nrow + 15) / 16;
     const RoleView m = role_view(g.blob[e], 2, H, F, gk2, dk2);
     const size_t kstep = (size_t) (H / 16) * (size_t) (4 * K2);
@@ -1612,26 +1616,31 @@ __global__ void __launch_bounds__(128) __attribute__((amdgpu_waves_per_eu(STRATA
         step(kt + 1, w1);
     }
 #pragma unroll
-    for (int ms = 0; ms < 4; ++ms)
+    for (int half = 0; half < 2; ++half) {
+        if (32 * half >= nrow) break;
+        if (half) __syncthreads();   // the first pass's reads are done
 #pragma unroll
-        for (int t = 0; t < 2; ++t)
+        for (int ms = 2 * half; ms < 2 * half + 2; ++ms)
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int rr = 16 * ms + 2 * i + (lane >> 4);
-                const float s = rr < nrow ? rs[3 * ((size_t) g.off[e] + (size_t) (row0 + rr)) + 2] : 0.f;
-                ys[rr][16 * (2 * wave + t) + (lane & 15)] = ex::kA * acc[ms][t][i] + ex::kBias * s;
-            }
-    __syncthreads();
-    for (int rr = wave; rr < nrow; rr += 4) {
-        float v[4];
+            for (int t = 0; t < 2; ++t)
 #pragma unroll
-        for (int k = 0; k < 4; ++k) v[k] = ys[rr][4 * lane + k];
-        had128_wave(v);
-        float y[4];
+                for (int i = 0; i < 8; ++i) {
+                    const int rr = 16 * ms + 2 * i + (lane >> 4);
+                    const float s = rr < nrow ? rs[3 * ((size_t) g.off[e] + (size_t) (row0 + rr)) + 2] : 0.f;
+                    ys[rr - 32 * half][16 * (2 * wave + t) + (lane & 15)] = ex::kA * acc[ms][t][i] + ex::kBias * s;
+                }
+        __syncthreads();
+        for (int rr = 32 * half + wave; rr < min(nrow, 32 * half + 32); rr += 4) {
+            float v[4];
 #pragma unroll
-        for (int k = 0; k < 4; ++k) y[k] = v[k] * (1.0f / 128.0f) * __half2float(m.svh[128 * ob + 4 * lane + k]);
-        *reinterpret_cast<float4*>(Dm + ((size_t) g.off[e] + (size_t) (row0 + rr)) * H + 128 * ob + 4 * lane) =
-            make_float4(y[0], y[1], y[2], y[3]);
+            for (int k = 0; k < 4; ++k) v[k] = ys[rr - 32 * half][4 * lane + k];
+            had128_wave(v);
+            float y[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) y[k] = v[k] * (1.0f / 128.0f) * __half2float(m.svh[128 * ob + 4 * lane + k]);
+            *reinterpret_cast<float4*>(Dm + ((size_t) g.off[e] + (size_t) (row0 + rr)) * H + 128 * ob + 4 * lane) =
+                make_float4(y[0], y[1], y[2], y[3]);
+        }
     }
 }
 }  // namespace pf
@@ -2037,20 +2046,26 @@ void exl3_pf_group(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, const 
     Exl3PfGroup g = in;
     g.rel[0] = 0;
     g.mc0[0] = 0;
+    g.mc1[0] = 0;
     for (int e = 0; e < g.n; ++e) {
         g.rel[e + 1] = g.rel[e] + g.cnt[e];
         g.mc0[e + 1] = g.mc0[e] + (g.cnt[e] + pf::MC - 1) / pf::MC;
+        g.mc1[e + 1] = g.mc1[e] + (g.cnt[e] + 2 * pf::MC - 1) / (2 * pf::MC);
     }
+#ifndef STRATA_PF_GU_MS
+#define STRATA_PF_GU_MS 4
+#endif
+    constexpr int GMS = STRATA_PF_GU_MS;
     const int R = g.rel[g.n];
     if (R <= 0) return;
     cudaStream_t s = (cudaStream_t) stream;
     const __half* X = reinterpret_cast<const __half*>(Xs);
     __half* Hhh = reinterpret_cast<__half*>(Hh);
     const unsigned b1 = (unsigned) ((2 * R + 7) / 8), b3 = (unsigned) ((R + 7) / 8);
-    const unsigned b2 = (unsigned) (g.mc0[g.n] * (pf::F / 128)), b4 = (unsigned) (g.mc0[g.n] * (pf::H / 128));
+    const unsigned b2 = (unsigned) ((GMS == 8 ? g.mc1[g.n] : g.mc0[g.n]) * (pf::F / 128)), b4 = (unsigned) (g.mc0[g.n] * (pf::H / 128));
 #define STRATA_PF(GK, DK) do { \
         pf::xform_in_kernel<GK, DK><<<b1, 256, 0, s>>>(g, X, Dm, rs); \
-        pf::gemm_gu_kernel<GK><<<b2, 256, 0, s>>>(g, gk2, dk2, Dm, rs, GU); \
+        pf::gemm_gu_kernel<GK, GMS><<<b2, 256, 0, s>>>(g, gk2, dk2, Dm, rs, GU); \
         pf::gu_post_kernel<GK, DK><<<b3, 256, 0, s>>>(g, GU, Hhh, rs); \
         pf::gemm_d_kernel<DK><<<b4, 128, 0, s>>>(g, gk2, dk2, Hhh, rs, Dm); } while (0)
     if (gk2 == 5 && dk2 == 5) STRATA_PF(5, 5);
