@@ -549,6 +549,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # FMA changes tie results. The embedding gather also relies on separately rounded operations.
     set_source_files_properties(src/kernels/cuda/elementwise.cu src/kernels/cuda/quantize_act.cu
       PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    # the EXL3 experts' decode arithmetic must be the CPU's bit for bit (exl3_expert.hpp): no contraction
+    set_source_files_properties(src/kernels/cuda/exl3_kernels.cu PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
   endif()
 
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")
@@ -2145,6 +2147,10 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(native_expert_parity PRIVATE ${_strata_gpu_include_directories})
     # strata_engine: the --load-check mode runs the engine's start-up checks (NativeDense, check_experts_gguf)
     target_link_libraries(native_expert_parity PRIVATE strata_engine strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_runtime_target})
+    # the GPU's EXL3 verify groups bit for bit against tools/exl3_ref.py's fixture (as exl3_cpu_parity checks the CPU)
+    add_executable(exl3_gpu_parity src/kernels/exl3_gpu_parity.cpp)
+    target_include_directories(exl3_gpu_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(exl3_gpu_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     # the prompt path's EXL3 dequantizer on a real expert (compared by tools/exl3_ref.py --dequant-check)
     add_executable(exl3_dequant_check src/kernels/exl3_dequant_check.cpp)
     target_include_directories(exl3_dequant_check PRIVATE ${_strata_gpu_include_directories})

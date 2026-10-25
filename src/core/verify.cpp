@@ -23,6 +23,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/exl3_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -928,7 +929,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         nat_xr_ = had_gu_any ? b.take<float>(T * N) : nullptr;
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+            std::max<uint64_t>(strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff),
+                               strata::kernels::exl3_expert_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff))));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
@@ -2187,7 +2189,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // `gy`: the native launch's groups side by side (0: cap, one block row per possible group).
         auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf,
                            cudaStream_t gst) {
-            if (lay.native) {
+            if (lay.native && lay.fmt[(size_t) l].exl3_gu) {
+                // EXL3 experts: each rotates and quantizes the F32 input itself (exl3_expert.hpp), bit for bit the CPU's
+                const auto& f = lay.fmt[(size_t) l];
+                strata::kernels::exl3_expert_grouped(f.gu_type, f.d_type, f.n_embd, f.n_ff, gp, gs, gn, p_dst, p_tok, cap,
+                                                     cap, mixed_ + (size_t) tb * N, hit_scratch_, dst_buf, gst);
+            } else if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
                 NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
